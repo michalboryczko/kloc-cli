@@ -40,6 +40,7 @@ RUN uv pip install --system -e . && uv pip install --system pyinstaller
 
 RUN pyinstaller --onefile --name kloc-cli \
     --collect-all src \
+    --collect-all rich \
     --clean \
     build_entry.py
 DOCKERFILE_EOF
@@ -80,6 +81,7 @@ build_macos() {
 
     pyinstaller --onefile --name kloc-cli \
         --collect-all src \
+        --collect-all rich \
         --clean \
         build_entry.py
 
