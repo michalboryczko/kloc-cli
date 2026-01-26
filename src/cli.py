@@ -64,13 +64,29 @@ def get_index(sot: str) -> SoTIndex:
 
 @app.command("mcp-server")
 def mcp_server_cmd(
-    sot: Path = typer.Option(..., "--sot", "-s", help="Path to SoT JSON file"),
+    sot: Optional[Path] = typer.Option(None, "--sot", "-s", help="Path to single SoT JSON file"),
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to config JSON with multiple projects"),
 ):
     """Start MCP server for AI assistant integration (stdio).
 
     Exposes kloc tools via Model Context Protocol for Claude and other AI assistants.
 
+    Single project mode:
+        kloc-cli mcp-server --sot /path/to/sot.json
+
+    Multi-project mode (config file):
+        kloc-cli mcp-server --config /path/to/kloc.json
+
+    Config file format:
+        {
+            "projects": [
+                {"name": "my-app", "sot": "/path/to/my-app-sot.json"},
+                {"name": "payments", "sot": "/path/to/payments-sot.json"}
+            ]
+        }
+
     Tools provided:
+    - kloc_projects: List available projects
     - kloc_resolve: Resolve symbol to definition
     - kloc_usages: Find usages with depth expansion
     - kloc_deps: Find dependencies with depth expansion
@@ -79,12 +95,24 @@ def mcp_server_cmd(
     - kloc_inherit: Show inheritance tree
     - kloc_overrides: Show method override tree
     """
-    if not sot.exists():
+    if not sot and not config:
+        console.print("[red]Error: Either --sot or --config is required[/red]", err=True)
+        raise typer.Exit(1)
+
+    if sot and config:
+        console.print("[red]Error: Cannot use both --sot and --config[/red]", err=True)
+        raise typer.Exit(1)
+
+    if sot and not sot.exists():
         console.print(f"[red]Error: SoT file not found: {sot}[/red]", err=True)
         raise typer.Exit(1)
 
+    if config and not config.exists():
+        console.print(f"[red]Error: Config file not found: {config}[/red]", err=True)
+        raise typer.Exit(1)
+
     from .server import run_mcp_server
-    run_mcp_server(str(sot))
+    run_mcp_server(config_path=str(config) if config else None, sot_path=str(sot) if sot else None)
 
 
 # =============================================================================

@@ -4,6 +4,15 @@ Implements JSON-RPC 2.0 based MCP protocol for Claude and other MCP clients.
 
 Usage:
     kloc-cli mcp-server --sot /path/to/sot.json
+    kloc-cli mcp-server --config /path/to/kloc.json
+
+Config file format:
+    {
+        "projects": [
+            {"name": "my-app", "sot": "/path/to/my-app-sot.json"},
+            {"name": "payments", "sot": "/path/to/payments-sot.json"}
+        ]
+    }
 """
 
 import json
@@ -33,22 +42,80 @@ def _count_tree_nodes(entries: list) -> int:
 
 
 class MCPServer:
-    """MCP server for kloc-cli."""
+    """MCP server for kloc-cli with multi-project support."""
 
-    def __init__(self, sot_path: str):
-        self.sot_path = sot_path
-        self._index: Optional[SoTIndex] = None
+    def __init__(self, config_path: Optional[str] = None, sot_path: Optional[str] = None):
+        """Initialize server with config file or single SoT path.
 
-    @property
-    def index(self) -> SoTIndex:
-        """Lazy-load the index."""
-        if self._index is None:
-            self._index = SoTIndex(self.sot_path)
-        return self._index
+        Args:
+            config_path: Path to JSON config file with multiple projects
+            sot_path: Path to single SoT file (creates default project)
+        """
+        self._projects: dict[str, str] = {}  # name -> sot_path
+        self._indexes: dict[str, SoTIndex] = {}  # name -> index (lazy loaded)
+
+        if config_path:
+            self._load_config(config_path)
+        elif sot_path:
+            self._projects["default"] = sot_path
+        else:
+            raise ValueError("Either config_path or sot_path must be provided")
+
+    def _load_config(self, config_path: str):
+        """Load projects from config file."""
+        with open(config_path, "r") as f:
+            config = json.load(f)
+
+        projects = config.get("projects", [])
+        if not projects:
+            raise ValueError("Config file must contain at least one project")
+
+        for proj in projects:
+            name = proj.get("name")
+            sot = proj.get("sot")
+            if not name or not sot:
+                raise ValueError("Each project must have 'name' and 'sot' fields")
+            self._projects[name] = sot
+
+    def _get_index(self, project: Optional[str] = None) -> SoTIndex:
+        """Get index for a project (lazy-loaded).
+
+        Args:
+            project: Project name. If None, uses default (only if single project).
+        """
+        if project is None:
+            if len(self._projects) == 1:
+                project = list(self._projects.keys())[0]
+            else:
+                raise ValueError(f"Multiple projects configured. Specify 'project' parameter. Available: {list(self._projects.keys())}")
+
+        if project not in self._projects:
+            raise ValueError(f"Unknown project: {project}. Available: {list(self._projects.keys())}")
+
+        if project not in self._indexes:
+            self._indexes[project] = SoTIndex(self._projects[project])
+
+        return self._indexes[project]
+
+    def get_projects(self) -> list[dict]:
+        """Return list of configured projects."""
+        return [{"name": name, "sot": path} for name, path in self._projects.items()]
 
     def get_tools(self) -> list[dict]:
         """Return list of available MCP tools."""
+        # Common project property for multi-project support
+        project_prop = {"type": "string", "description": "Project name (required if multiple projects configured)"}
+
         return [
+            {
+                "name": "kloc_projects",
+                "description": "List all configured projects. Use this to discover available projects before querying.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+            },
             {
                 "name": "kloc_resolve",
                 "description": "Resolve a symbol to its definition location. Supports FQN, partial match, or method syntax.",
@@ -56,6 +123,7 @@ class MCPServer:
                     "type": "object",
                     "properties": {
                         "symbol": {"type": "string", "description": "Symbol to resolve"},
+                        "project": project_prop,
                     },
                     "required": ["symbol"],
                 },
@@ -69,6 +137,7 @@ class MCPServer:
                         "symbol": {"type": "string", "description": "Symbol to find usages for"},
                         "depth": {"type": "integer", "description": "BFS depth (default: 1)", "default": 1},
                         "limit": {"type": "integer", "description": "Max results (default: 50)", "default": 50},
+                        "project": project_prop,
                     },
                     "required": ["symbol"],
                 },
@@ -82,6 +151,7 @@ class MCPServer:
                         "symbol": {"type": "string", "description": "Symbol to find dependencies for"},
                         "depth": {"type": "integer", "description": "BFS depth (default: 1)", "default": 1},
                         "limit": {"type": "integer", "description": "Max results (default: 50)", "default": 50},
+                        "project": project_prop,
                     },
                     "required": ["symbol"],
                 },
@@ -96,6 +166,7 @@ class MCPServer:
                         "depth": {"type": "integer", "description": "BFS depth (default: 1)", "default": 1},
                         "limit": {"type": "integer", "description": "Max results per direction (default: 50)", "default": 50},
                         "include_impl": {"type": "boolean", "description": "Include implementations/overrides", "default": False},
+                        "project": project_prop,
                     },
                     "required": ["symbol"],
                 },
@@ -107,6 +178,7 @@ class MCPServer:
                     "type": "object",
                     "properties": {
                         "symbol": {"type": "string", "description": "Symbol to find ownership for"},
+                        "project": project_prop,
                     },
                     "required": ["symbol"],
                 },
@@ -121,6 +193,7 @@ class MCPServer:
                         "direction": {"type": "string", "enum": ["up", "down"], "description": "up=ancestors, down=descendants", "default": "up"},
                         "depth": {"type": "integer", "description": "BFS depth (default: 1)", "default": 1},
                         "limit": {"type": "integer", "description": "Max results (default: 100)", "default": 100},
+                        "project": project_prop,
                     },
                     "required": ["symbol"],
                 },
@@ -135,6 +208,7 @@ class MCPServer:
                         "direction": {"type": "string", "enum": ["up", "down"], "description": "up=overridden, down=overriding", "default": "up"},
                         "depth": {"type": "integer", "description": "BFS depth (default: 1)", "default": 1},
                         "limit": {"type": "integer", "description": "Max results (default: 100)", "default": 100},
+                        "project": project_prop,
                     },
                     "required": ["symbol"],
                 },
@@ -144,6 +218,7 @@ class MCPServer:
     def call_tool(self, name: str, arguments: dict) -> Any:
         """Call a tool by name."""
         handlers = {
+            "kloc_projects": self._handle_projects,
             "kloc_resolve": self._handle_resolve,
             "kloc_usages": self._handle_usages,
             "kloc_deps": self._handle_deps,
@@ -157,9 +232,10 @@ class MCPServer:
             raise ValueError(f"Unknown tool: {name}")
         return handler(arguments)
 
-    def _resolve_symbol(self, symbol: str):
+    def _resolve_symbol(self, symbol: str, project: Optional[str] = None):
         """Resolve symbol and return node or raise error."""
-        query = ResolveQuery(self.index)
+        index = self._get_index(project)
+        query = ResolveQuery(index)
         result = query.execute(symbol)
 
         if not result.found:
@@ -171,16 +247,23 @@ class MCPServer:
 
         return result.candidates[0]
 
+    def _handle_projects(self, args: dict) -> dict:
+        """List all configured projects."""
+        return {"projects": self.get_projects()}
+
     def _handle_resolve(self, args: dict) -> dict:
-        node = self._resolve_symbol(args["symbol"])
+        project = args.get("project")
+        node = self._resolve_symbol(args["symbol"], project)
         result = {"id": node.id, "kind": node.kind, "name": node.name, "fqn": node.fqn, "file": node.file, "line": node.start_line + 1 if node.start_line is not None else None}
         if node.signature:
             result["signature"] = node.signature
         return result
 
     def _handle_usages(self, args: dict) -> dict:
-        node = self._resolve_symbol(args["symbol"])
-        query = UsagesQuery(self.index)
+        project = args.get("project")
+        node = self._resolve_symbol(args["symbol"], project)
+        index = self._get_index(project)
+        query = UsagesQuery(index)
         result = query.execute(node.id, depth=args.get("depth", 1), limit=args.get("limit", 50))
 
         def entry_to_dict(e):
@@ -189,8 +272,10 @@ class MCPServer:
         return {"target": {"fqn": node.fqn, "file": node.file}, "total": _count_tree_nodes(result.tree), "tree": [entry_to_dict(e) for e in result.tree]}
 
     def _handle_deps(self, args: dict) -> dict:
-        node = self._resolve_symbol(args["symbol"])
-        query = DepsQuery(self.index)
+        project = args.get("project")
+        node = self._resolve_symbol(args["symbol"], project)
+        index = self._get_index(project)
+        query = DepsQuery(index)
         result = query.execute(node.id, depth=args.get("depth", 1), limit=args.get("limit", 50))
 
         def entry_to_dict(e):
@@ -199,8 +284,10 @@ class MCPServer:
         return {"target": {"fqn": node.fqn, "file": node.file}, "total": _count_tree_nodes(result.tree), "tree": [entry_to_dict(e) for e in result.tree]}
 
     def _handle_context(self, args: dict) -> dict:
-        node = self._resolve_symbol(args["symbol"])
-        query = ContextQuery(self.index)
+        project = args.get("project")
+        node = self._resolve_symbol(args["symbol"], project)
+        index = self._get_index(project)
+        query = ContextQuery(index)
         result = query.execute(node.id, depth=args.get("depth", 1), limit=args.get("limit", 50), include_impl=args.get("include_impl", False))
 
         def entry_to_dict(e):
@@ -214,16 +301,20 @@ class MCPServer:
         return {"target": {"fqn": result.target.fqn, "file": result.target.file}, "used_by": [entry_to_dict(e) for e in result.used_by], "uses": [entry_to_dict(e) for e in result.uses]}
 
     def _handle_owners(self, args: dict) -> dict:
-        node = self._resolve_symbol(args["symbol"])
-        query = OwnersQuery(self.index)
+        project = args.get("project")
+        node = self._resolve_symbol(args["symbol"], project)
+        index = self._get_index(project)
+        query = OwnersQuery(index)
         result = query.execute(node.id)
         return {"chain": [{"kind": n.kind, "fqn": n.fqn, "file": n.file} for n in result.chain]}
 
     def _handle_inherit(self, args: dict) -> dict:
-        node = self._resolve_symbol(args["symbol"])
+        project = args.get("project")
+        node = self._resolve_symbol(args["symbol"], project)
         if node.kind not in ("Class", "Interface", "Trait", "Enum"):
             raise ValueError(f"Symbol must be a class/interface, got: {node.kind}")
-        query = InheritQuery(self.index)
+        index = self._get_index(project)
+        query = InheritQuery(index)
         result = query.execute(node.id, direction=args.get("direction", "up"), depth=args.get("depth", 1), limit=args.get("limit", 100))
 
         def entry_to_dict(e):
@@ -232,10 +323,12 @@ class MCPServer:
         return {"root": {"fqn": node.fqn}, "direction": result.direction, "tree": [entry_to_dict(e) for e in result.tree]}
 
     def _handle_overrides(self, args: dict) -> dict:
-        node = self._resolve_symbol(args["symbol"])
+        project = args.get("project")
+        node = self._resolve_symbol(args["symbol"], project)
         if node.kind != "Method":
             raise ValueError(f"Symbol must be a method, got: {node.kind}")
-        query = OverridesQuery(self.index)
+        index = self._get_index(project)
+        query = OverridesQuery(index)
         result = query.execute(node.id, direction=args.get("direction", "up"), depth=args.get("depth", 1), limit=args.get("limit", 100))
 
         def entry_to_dict(e):
@@ -244,9 +337,14 @@ class MCPServer:
         return {"root": {"fqn": node.fqn}, "direction": result.direction, "tree": [entry_to_dict(e) for e in result.tree]}
 
 
-def run_mcp_server(sot_path: str):
-    """Run the MCP server using stdio with JSON-RPC 2.0 protocol."""
-    server = MCPServer(sot_path)
+def run_mcp_server(config_path: Optional[str] = None, sot_path: Optional[str] = None):
+    """Run the MCP server using stdio with JSON-RPC 2.0 protocol.
+
+    Args:
+        config_path: Path to JSON config file with multiple projects
+        sot_path: Path to single SoT file (creates default project)
+    """
+    server = MCPServer(config_path=config_path, sot_path=sot_path)
 
     def send_response(id: Any, result: Any = None, error: Any = None):
         response = {"jsonrpc": "2.0", "id": id}
@@ -276,7 +374,7 @@ def run_mcp_server(sot_path: str):
                 send_response(req_id, {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "kloc-cli", "version": "0.2.0"}
+                    "serverInfo": {"name": "kloc-cli", "version": "0.3.0"}
                 })
             elif method == "notifications/initialized":
                 pass  # No response needed for notifications
@@ -299,9 +397,11 @@ def main():
     """Main entry point."""
     import argparse
     parser = argparse.ArgumentParser(description="KLOC MCP Server")
-    parser.add_argument("--sot", "-s", required=True, help="Path to SoT JSON file")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--sot", "-s", help="Path to single SoT JSON file")
+    group.add_argument("--config", "-c", help="Path to config JSON file with multiple projects")
     args = parser.parse_args()
-    run_mcp_server(args.sot)
+    run_mcp_server(config_path=args.config, sot_path=args.sot)
 
 
 if __name__ == "__main__":
