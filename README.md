@@ -1,0 +1,314 @@
+# kloc-cli
+
+A fast CLI for querying KLOC Source-of-Truth (SoT) JSON files. Query code structure, find usages, explore dependencies, and trace inheritance hierarchies.
+
+## Features
+
+- **Symbol Resolution** - Find definitions by FQN, partial match, or short name
+- **Usage Analysis** - Find all references to a symbol across the codebase
+- **Dependency Tracking** - See what a symbol depends on
+- **Context Exploration** - Bidirectional analysis with configurable depth
+- **Ownership Chain** - Trace structural containment (method → class → file)
+- **Inheritance** - Explore class hierarchies up and down
+- **Override Chains** - Track method overrides through inheritance
+- **MCP Server** - Model Context Protocol integration for AI assistants
+- **Precomputed Indexes** - O(1) lookups for inheritance and override chains
+
+## Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/your-org/kloc-cli.git
+cd kloc-cli
+
+# Create virtual environment and install
+python -m venv venv
+source venv/bin/activate
+pip install -e .
+
+# Or with uv (faster)
+uv venv
+source .venv/bin/activate
+uv pip install -e .
+```
+
+## CLI Usage
+
+All commands require a `--sot` flag pointing to the SoT JSON file.
+
+### resolve
+
+Resolve a symbol to its definition location.
+
+```bash
+# Exact FQN match
+kloc-cli resolve "App\\Entity\\User" --sot sot.json
+
+# Partial match (finds all symbols containing "User")
+kloc-cli resolve User --sot sot.json
+
+# Method syntax
+kloc-cli resolve "User::getId" --sot sot.json
+
+# JSON output
+kloc-cli resolve User --sot sot.json --json
+```
+
+### usages
+
+Find all usages of a symbol with depth expansion.
+
+```bash
+# Direct usages only (depth=1)
+kloc-cli usages "App\\Entity\\User" --sot sot.json
+
+# Transitive usages (depth=2: what uses User, and what uses those)
+kloc-cli usages User --sot sot.json --depth 2
+
+# With limit
+kloc-cli usages User --sot sot.json --depth 3 --limit 50
+
+# JSON output with tree structure
+kloc-cli usages User --sot sot.json --depth 2 --json
+```
+
+### deps
+
+Find all dependencies of a symbol with depth expansion.
+
+```bash
+# Direct dependencies only (depth=1)
+kloc-cli deps "App\\Service\\UserService" --sot sot.json
+
+# Transitive dependencies (depth=2: what UserService uses, and what those use)
+kloc-cli deps UserService --sot sot.json --depth 2
+
+# Deep dependency tree
+kloc-cli deps UserService --sot sot.json --depth 3 --limit 100
+```
+
+**Tree Output Example:**
+```
+Dependencies of App\Service\UserService (depth=2):
+App\Service\UserService
+├── [1] App\Entity\User (src/Service/UserService.php:15)
+│   ├── [2] App\Entity\BaseEntity
+│   └── [2] App\Enum\UserStatus
+├── [1] App\Repository\UserRepository (src/Service/UserService.php:16)
+│   └── [2] Doctrine\ORM\EntityManagerInterface
+└── [1] Psr\Log\LoggerInterface (src/Service/UserService.php:17)
+```
+
+### context
+
+Get bidirectional context: what uses the symbol AND what it uses.
+
+```bash
+# Default depth=1
+kloc-cli context UserService --sot sot.json
+
+# Deeper exploration
+kloc-cli context UserService --sot sot.json --depth 2 --limit 100
+
+# Polymorphic analysis with --impl flag
+kloc-cli context UserServiceInterface --sot sot.json --impl
+```
+
+The `--impl` flag enables polymorphic analysis:
+- **USES direction**: Shows implementations of interfaces and overriding methods
+- **USED BY direction**: Includes usages of interface methods that concrete methods implement
+
+For example, when querying `ConcreteService::doSomething()` that implements `ServiceInterface::doSomething()`, the `--impl` flag will also show all callers that use `ServiceInterface::doSomething()`, giving you the full picture of who depends on this functionality.
+
+### owners
+
+Show structural containment chain (method → class → file).
+
+```bash
+kloc-cli owners "App\\Entity\\User::getId" --sot sot.json
+```
+
+Output:
+```
+Method: App\Entity\User::getId
+  └─ Class: App\Entity\User
+      └─ File: src/Entity/User.php
+```
+
+### inherit
+
+Show inheritance chain for a class.
+
+```bash
+# Ancestors (parents, grandparents, ...)
+kloc-cli inherit User --sot sot.json --direction up
+
+# Descendants (children, grandchildren, ...)
+kloc-cli inherit User --sot sot.json --direction down
+```
+
+### overrides
+
+Show override chain for a method.
+
+```bash
+# Find the original definition
+kloc-cli overrides "AdminUser::getName" --sot sot.json --direction up
+
+# Find all overriding methods
+kloc-cli overrides "User::getName" --sot sot.json --direction down
+```
+
+## MCP Server
+
+The MCP server exposes all query functionality to AI assistants like Claude.
+
+### Starting the MCP Server
+
+```bash
+kloc-cli mcp-server --sot sot.json
+```
+
+The server reads JSON requests from stdin and writes responses to stdout.
+
+### Claude MCP Configuration
+
+Add to your Claude MCP settings:
+
+```json
+{
+  "mcpServers": {
+    "kloc": {
+      "command": "kloc-cli",
+      "args": ["mcp-server", "--sot", "/path/to/sot.json"]
+    }
+  }
+}
+```
+
+### Available MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `kloc_resolve` | Resolve symbol to definition location |
+| `kloc_usages` | Find all usages of a symbol (with depth) |
+| `kloc_deps` | Find dependencies of a symbol (with depth) |
+| `kloc_context` | Get bidirectional context (with depth, impl flag) |
+| `kloc_owners` | Show structural containment chain |
+| `kloc_inherit` | Show inheritance tree (with depth) |
+| `kloc_overrides` | Show method override tree (with depth) |
+
+### MCP Protocol Example
+
+```json
+// Request
+{"method": "call_tool", "name": "kloc_resolve", "arguments": {"symbol": "User"}}
+
+// Response
+{"id": "node:123", "kind": "Class", "name": "User", "fqn": "App\\Entity\\User", "file": "src/Entity/User.php", "line": 15}
+```
+
+## Python API
+
+```python
+from kloc_cli import SoTIndex
+from kloc_cli.queries import (
+    ResolveQuery,
+    UsagesQuery,
+    DepsQuery,
+    ContextQuery,
+    OwnersQuery,
+    InheritQuery,
+    OverridesQuery,
+)
+
+# Load the index
+index = SoTIndex("sot.json")
+
+# Resolve a symbol
+resolver = ResolveQuery(index)
+result = resolver.execute("App\\Entity\\User")
+
+if result.found and result.unique:
+    node = result.candidates[0]
+    print(f"Found: {node.fqn} at {node.file}:{node.start_line}")
+
+# Find usages
+usages = UsagesQuery(index)
+for usage in usages.execute(node.id, limit=50):
+    print(f"  Used at {usage.file}:{usage.line} by {usage.referrer_fqn}")
+
+# Get inheritance chain
+inherit = InheritQuery(index)
+ancestors = inherit.execute(node.id, direction="up")
+for ancestor in ancestors.chain:
+    print(f"  extends {ancestor.fqn}")
+
+# Get context
+context = ContextQuery(index)
+ctx = context.execute(node.id, depth=2, limit=100)
+print(f"Used by {len(ctx.used_by)} symbols")
+print(f"Uses {len(ctx.uses)} symbols")
+```
+
+## Architecture
+
+```
+kloc-cli/
+├── src/
+│   ├── cli.py              # Typer CLI commands
+│   ├── models/             # Data classes
+│   │   ├── node.py         # NodeData
+│   │   ├── edge.py         # EdgeData
+│   │   └── results.py      # Query result types
+│   ├── graph/              # Core graph operations
+│   │   ├── index.py        # SoTIndex class
+│   │   ├── loader.py       # JSON loading (msgspec)
+│   │   ├── precompute.py   # Transitive closures
+│   │   └── trie.py         # Symbol prefix trie
+│   ├── queries/            # Query implementations
+│   │   ├── base.py         # Query base class
+│   │   ├── resolve.py      # Symbol resolution
+│   │   ├── usages.py       # Find usages
+│   │   ├── deps.py         # Find dependencies
+│   │   ├── context.py      # Bidirectional context
+│   │   ├── owners.py       # Containment chain
+│   │   ├── inherit.py      # Inheritance chain
+│   │   └── overrides.py    # Override chain
+│   ├── output/             # Formatters
+│   │   ├── json_formatter.py
+│   │   └── tree.py         # Tree output formatters
+│   └── server/             # MCP integration
+│       └── mcp.py          # MCP server
+└── tests/
+```
+
+## Performance
+
+| Operation | Time |
+|-----------|------|
+| Cold start (1MB JSON) | ~50ms |
+| Symbol resolve (exact) | <1ms |
+| Symbol resolve (partial) | <1ms (trie) |
+| Inheritance chain | <1ms (precomputed) |
+| Override chain | <1ms (precomputed) |
+
+## Development
+
+```bash
+# Install dev dependencies
+pip install -e ".[dev]"
+
+# Run tests
+pytest
+
+# Run linter
+ruff check src/
+
+# Format code
+ruff format src/
+```
+
+## License
+
+MIT
