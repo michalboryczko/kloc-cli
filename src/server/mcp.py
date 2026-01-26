@@ -1,16 +1,11 @@
-"""MCP (Model Context Protocol) server adapter for kloc-cli.
+"""MCP (Model Context Protocol) server for kloc-cli.
 
-This module provides an MCP server that exposes kloc-cli functionality
-to AI assistants and other MCP clients.
+Implements JSON-RPC 2.0 based MCP protocol for Claude and other MCP clients.
 
 Usage:
-    python -m src.server.mcp --sot /path/to/sot.json
-
-Or via the CLI:
     kloc-cli mcp-server --sot /path/to/sot.json
 """
 
-import argparse
 import json
 import sys
 from typing import Any, Optional
@@ -38,199 +33,116 @@ def _count_tree_nodes(entries: list) -> int:
 
 
 class MCPServer:
-    """MCP server for kloc-cli.
-
-    Provides tools for querying code structure via MCP protocol.
-    """
+    """MCP server for kloc-cli."""
 
     def __init__(self, sot_path: str):
-        """Initialize the MCP server.
+        self.sot_path = sot_path
+        self._index: Optional[SoTIndex] = None
 
-        Args:
-            sot_path: Path to the SoT JSON file.
-        """
-        self.index = SoTIndex(sot_path)
+    @property
+    def index(self) -> SoTIndex:
+        """Lazy-load the index."""
+        if self._index is None:
+            self._index = SoTIndex(self.sot_path)
+        return self._index
 
     def get_tools(self) -> list[dict]:
         """Return list of available MCP tools."""
         return [
             {
                 "name": "kloc_resolve",
-                "description": "Resolve a symbol to its definition location. Supports FQN (App\\Entity\\User), partial match (User), or method syntax (User::getId()).",
+                "description": "Resolve a symbol to its definition location. Supports FQN, partial match, or method syntax.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "symbol": {
-                            "type": "string",
-                            "description": "Symbol to resolve (FQN, partial, or short name)",
-                        },
+                        "symbol": {"type": "string", "description": "Symbol to resolve"},
                     },
                     "required": ["symbol"],
                 },
             },
             {
                 "name": "kloc_usages",
-                "description": "Find all usages of a symbol with depth expansion. Returns tree of usages.",
+                "description": "Find all usages of a symbol with depth expansion.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "symbol": {
-                            "type": "string",
-                            "description": "Symbol to find usages for",
-                        },
-                        "depth": {
-                            "type": "integer",
-                            "description": "BFS depth for expansion (default: 1)",
-                            "default": 1,
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of results (default: 50)",
-                            "default": 50,
-                        },
+                        "symbol": {"type": "string", "description": "Symbol to find usages for"},
+                        "depth": {"type": "integer", "description": "BFS depth (default: 1)", "default": 1},
+                        "limit": {"type": "integer", "description": "Max results (default: 50)", "default": 50},
                     },
                     "required": ["symbol"],
                 },
             },
             {
                 "name": "kloc_deps",
-                "description": "Find all dependencies of a symbol with depth expansion. Returns tree of dependencies.",
+                "description": "Find all dependencies of a symbol with depth expansion.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "symbol": {
-                            "type": "string",
-                            "description": "Symbol to find dependencies for",
-                        },
-                        "depth": {
-                            "type": "integer",
-                            "description": "BFS depth for expansion (default: 1)",
-                            "default": 1,
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of results (default: 50)",
-                            "default": 50,
-                        },
+                        "symbol": {"type": "string", "description": "Symbol to find dependencies for"},
+                        "depth": {"type": "integer", "description": "BFS depth (default: 1)", "default": 1},
+                        "limit": {"type": "integer", "description": "Max results (default: 50)", "default": 50},
                     },
                     "required": ["symbol"],
                 },
             },
             {
                 "name": "kloc_context",
-                "description": "Get bidirectional context for a symbol: both what uses it and what it uses, with configurable depth. Optionally includes implementations (for classes/interfaces) or overrides (for methods).",
+                "description": "Get bidirectional context: what uses it and what it uses. With include_impl, shows implementations/overrides.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "symbol": {
-                            "type": "string",
-                            "description": "Symbol to get context for",
-                        },
-                        "depth": {
-                            "type": "integer",
-                            "description": "BFS depth for expansion (default: 1)",
-                            "default": 1,
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum results per direction (default: 50)",
-                            "default": 50,
-                        },
-                        "include_impl": {
-                            "type": "boolean",
-                            "description": "Include implementations (for classes/interfaces) or overrides (for methods)",
-                            "default": False,
-                        },
+                        "symbol": {"type": "string", "description": "Symbol to get context for"},
+                        "depth": {"type": "integer", "description": "BFS depth (default: 1)", "default": 1},
+                        "limit": {"type": "integer", "description": "Max results per direction (default: 50)", "default": 50},
+                        "include_impl": {"type": "boolean", "description": "Include implementations/overrides", "default": False},
                     },
                     "required": ["symbol"],
                 },
             },
             {
                 "name": "kloc_owners",
-                "description": "Show structural containment chain (e.g., Method -> Class -> File).",
+                "description": "Show structural containment chain (Method -> Class -> File).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "symbol": {
-                            "type": "string",
-                            "description": "Symbol to find ownership chain for",
-                        },
+                        "symbol": {"type": "string", "description": "Symbol to find ownership for"},
                     },
                     "required": ["symbol"],
                 },
             },
             {
                 "name": "kloc_inherit",
-                "description": "Show inheritance tree for a class with depth expansion. Returns ancestors or descendants.",
+                "description": "Show inheritance tree for a class.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "symbol": {
-                            "type": "string",
-                            "description": "Class to show inheritance for",
-                        },
-                        "direction": {
-                            "type": "string",
-                            "enum": ["up", "down"],
-                            "description": "Direction: 'up' for ancestors, 'down' for descendants",
-                            "default": "up",
-                        },
-                        "depth": {
-                            "type": "integer",
-                            "description": "BFS depth for expansion (default: 1)",
-                            "default": 1,
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of results (default: 100)",
-                            "default": 100,
-                        },
+                        "symbol": {"type": "string", "description": "Class to show inheritance for"},
+                        "direction": {"type": "string", "enum": ["up", "down"], "description": "up=ancestors, down=descendants", "default": "up"},
+                        "depth": {"type": "integer", "description": "BFS depth (default: 1)", "default": 1},
+                        "limit": {"type": "integer", "description": "Max results (default: 100)", "default": 100},
                     },
                     "required": ["symbol"],
                 },
             },
             {
                 "name": "kloc_overrides",
-                "description": "Show override tree for a method with depth expansion.",
+                "description": "Show override tree for a method.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "symbol": {
-                            "type": "string",
-                            "description": "Method to show override chain for",
-                        },
-                        "direction": {
-                            "type": "string",
-                            "enum": ["up", "down"],
-                            "description": "Direction: 'up' for overridden, 'down' for overriding",
-                            "default": "up",
-                        },
-                        "depth": {
-                            "type": "integer",
-                            "description": "BFS depth for expansion (default: 1)",
-                            "default": 1,
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of results (default: 100)",
-                            "default": 100,
-                        },
+                        "symbol": {"type": "string", "description": "Method to show overrides for"},
+                        "direction": {"type": "string", "enum": ["up", "down"], "description": "up=overridden, down=overriding", "default": "up"},
+                        "depth": {"type": "integer", "description": "BFS depth (default: 1)", "default": 1},
+                        "limit": {"type": "integer", "description": "Max results (default: 100)", "default": 100},
                     },
                     "required": ["symbol"],
                 },
             },
         ]
 
-    def call_tool(self, name: str, arguments: dict) -> dict:
-        """Call a tool by name with arguments.
-
-        Args:
-            name: Tool name (e.g., "kloc_resolve")
-            arguments: Tool arguments
-
-        Returns:
-            Tool result as a dictionary
-        """
+    def call_tool(self, name: str, arguments: dict) -> Any:
+        """Call a tool by name."""
         handlers = {
             "kloc_resolve": self._handle_resolve,
             "kloc_usages": self._handle_usages,
@@ -240,286 +152,110 @@ class MCPServer:
             "kloc_inherit": self._handle_inherit,
             "kloc_overrides": self._handle_overrides,
         }
-
         handler = handlers.get(name)
         if not handler:
-            return {"error": f"Unknown tool: {name}"}
+            raise ValueError(f"Unknown tool: {name}")
+        return handler(arguments)
 
-        try:
-            return handler(arguments)
-        except Exception as e:
-            return {"error": str(e)}
-
-    def _resolve_symbol(self, symbol: str) -> tuple[Optional[Any], Optional[dict]]:
-        """Resolve symbol and return (node, error_dict)."""
+    def _resolve_symbol(self, symbol: str):
+        """Resolve symbol and return node or raise error."""
         query = ResolveQuery(self.index)
         result = query.execute(symbol)
 
         if not result.found:
-            return None, {"error": "not_found", "message": f"Symbol not found: {symbol}"}
+            raise ValueError(f"Symbol not found: {symbol}")
 
         if not result.unique:
-            return None, {
-                "error": "ambiguous",
-                "message": f"Found {len(result.candidates)} candidates",
-                "candidates": [
-                    {"id": c.id, "kind": c.kind, "fqn": c.fqn}
-                    for c in result.candidates
-                ],
-            }
+            candidates = [{"id": c.id, "kind": c.kind, "fqn": c.fqn} for c in result.candidates]
+            raise ValueError(f"Ambiguous: {len(result.candidates)} candidates: {candidates}")
 
-        return result.candidates[0], None
+        return result.candidates[0]
 
     def _handle_resolve(self, args: dict) -> dict:
-        """Handle kloc_resolve tool call."""
-        symbol = args.get("symbol")
-        if not symbol:
-            return {"error": "Missing required parameter: symbol"}
-
-        node, error = self._resolve_symbol(symbol)
-        if error:
-            return error
-
-        result = {
-            "id": node.id,
-            "kind": node.kind,
-            "name": node.name,
-            "fqn": node.fqn,
-            "file": node.file,
-            "line": node.start_line + 1 if node.start_line is not None else None,
-        }
-        # Include signature for methods/functions
+        node = self._resolve_symbol(args["symbol"])
+        result = {"id": node.id, "kind": node.kind, "name": node.name, "fqn": node.fqn, "file": node.file, "line": node.start_line + 1 if node.start_line is not None else None}
         if node.signature:
             result["signature"] = node.signature
         return result
 
     def _handle_usages(self, args: dict) -> dict:
-        """Handle kloc_usages tool call."""
-        symbol = args.get("symbol")
-        depth = args.get("depth", 1)
-        limit = args.get("limit", 50)
-
-        if not symbol:
-            return {"error": "Missing required parameter: symbol"}
-
-        node, error = self._resolve_symbol(symbol)
-        if error:
-            return error
-
+        node = self._resolve_symbol(args["symbol"])
         query = UsagesQuery(self.index)
-        result = query.execute(node.id, depth=depth, limit=limit)
+        result = query.execute(node.id, depth=args.get("depth", 1), limit=args.get("limit", 50))
 
-        def entry_to_dict(entry):
-            return {
-                "depth": entry.depth,
-                "fqn": entry.fqn,
-                "file": entry.file,
-                "line": entry.line + 1 if entry.line is not None else None,
-                "children": [entry_to_dict(c) for c in entry.children],
-            }
+        def entry_to_dict(e):
+            return {"depth": e.depth, "fqn": e.fqn, "file": e.file, "line": e.line + 1 if e.line else None, "children": [entry_to_dict(c) for c in e.children]}
 
-        return {
-            "target": {"fqn": node.fqn, "file": node.file},
-            "max_depth": result.max_depth,
-            "total": _count_tree_nodes(result.tree),
-            "tree": [entry_to_dict(e) for e in result.tree],
-        }
+        return {"target": {"fqn": node.fqn, "file": node.file}, "total": _count_tree_nodes(result.tree), "tree": [entry_to_dict(e) for e in result.tree]}
 
     def _handle_deps(self, args: dict) -> dict:
-        """Handle kloc_deps tool call."""
-        symbol = args.get("symbol")
-        depth = args.get("depth", 1)
-        limit = args.get("limit", 50)
-
-        if not symbol:
-            return {"error": "Missing required parameter: symbol"}
-
-        node, error = self._resolve_symbol(symbol)
-        if error:
-            return error
-
+        node = self._resolve_symbol(args["symbol"])
         query = DepsQuery(self.index)
-        result = query.execute(node.id, depth=depth, limit=limit)
+        result = query.execute(node.id, depth=args.get("depth", 1), limit=args.get("limit", 50))
 
-        def entry_to_dict(entry):
-            return {
-                "depth": entry.depth,
-                "fqn": entry.fqn,
-                "file": entry.file,
-                "line": entry.line + 1 if entry.line is not None else None,
-                "children": [entry_to_dict(c) for c in entry.children],
-            }
+        def entry_to_dict(e):
+            return {"depth": e.depth, "fqn": e.fqn, "file": e.file, "line": e.line + 1 if e.line else None, "children": [entry_to_dict(c) for c in e.children]}
 
-        return {
-            "target": {"fqn": node.fqn, "file": node.file},
-            "max_depth": result.max_depth,
-            "total": _count_tree_nodes(result.tree),
-            "tree": [entry_to_dict(e) for e in result.tree],
-        }
+        return {"target": {"fqn": node.fqn, "file": node.file}, "total": _count_tree_nodes(result.tree), "tree": [entry_to_dict(e) for e in result.tree]}
 
     def _handle_context(self, args: dict) -> dict:
-        """Handle kloc_context tool call."""
-        symbol = args.get("symbol")
-        depth = args.get("depth", 1)
-        limit = args.get("limit", 50)
-        include_impl = args.get("include_impl", False)
-
-        if not symbol:
-            return {"error": "Missing required parameter: symbol"}
-
-        node, error = self._resolve_symbol(symbol)
-        if error:
-            return error
-
+        node = self._resolve_symbol(args["symbol"])
         query = ContextQuery(self.index)
-        result = query.execute(node.id, depth=depth, limit=limit, include_impl=include_impl)
+        result = query.execute(node.id, depth=args.get("depth", 1), limit=args.get("limit", 50), include_impl=args.get("include_impl", False))
 
-        def context_entry_to_dict(entry):
-            d = {
-                "depth": entry.depth,
-                "fqn": entry.fqn,
-                "kind": entry.kind,
-                "file": entry.file,
-                "line": entry.line + 1 if entry.line is not None else None,
-                "children": [context_entry_to_dict(c) for c in entry.children],
-            }
-            # Include signature if present (for methods/functions)
-            if entry.signature:
-                d["signature"] = entry.signature
-            # Include implementations if present (for interfaces/methods)
-            if entry.implementations:
-                d["implementations"] = [context_entry_to_dict(impl) for impl in entry.implementations]
+        def entry_to_dict(e):
+            d = {"depth": e.depth, "fqn": e.fqn, "kind": e.kind, "file": e.file, "line": e.line + 1 if e.line else None, "children": [entry_to_dict(c) for c in e.children]}
+            if e.signature:
+                d["signature"] = e.signature
+            if e.implementations:
+                d["implementations"] = [entry_to_dict(i) for i in e.implementations]
             return d
 
-        target_dict = {
-            "fqn": result.target.fqn,
-            "file": result.target.file,
-            "line": (
-                result.target.start_line + 1
-                if result.target.start_line is not None
-                else None
-            ),
-        }
-        # Include signature for methods/functions
-        if result.target.signature:
-            target_dict["signature"] = result.target.signature
-
-        return {
-            "target": target_dict,
-            "max_depth": result.max_depth,
-            "used_by": [context_entry_to_dict(e) for e in result.used_by],
-            "uses": [context_entry_to_dict(e) for e in result.uses],
-        }
+        return {"target": {"fqn": result.target.fqn, "file": result.target.file}, "used_by": [entry_to_dict(e) for e in result.used_by], "uses": [entry_to_dict(e) for e in result.uses]}
 
     def _handle_owners(self, args: dict) -> dict:
-        """Handle kloc_owners tool call."""
-        symbol = args.get("symbol")
-
-        if not symbol:
-            return {"error": "Missing required parameter: symbol"}
-
-        node, error = self._resolve_symbol(symbol)
-        if error:
-            return error
-
+        node = self._resolve_symbol(args["symbol"])
         query = OwnersQuery(self.index)
         result = query.execute(node.id)
-
-        return {
-            "chain": [
-                {"kind": n.kind, "fqn": n.fqn, "file": n.file}
-                for n in result.chain
-            ],
-        }
+        return {"chain": [{"kind": n.kind, "fqn": n.fqn, "file": n.file} for n in result.chain]}
 
     def _handle_inherit(self, args: dict) -> dict:
-        """Handle kloc_inherit tool call."""
-        symbol = args.get("symbol")
-        direction = args.get("direction", "up")
-        depth = args.get("depth", 1)
-        limit = args.get("limit", 100)
-
-        if not symbol:
-            return {"error": "Missing required parameter: symbol"}
-
-        node, error = self._resolve_symbol(symbol)
-        if error:
-            return error
-
+        node = self._resolve_symbol(args["symbol"])
         if node.kind not in ("Class", "Interface", "Trait", "Enum"):
-            return {"error": f"Symbol must be a class/interface, got: {node.kind}"}
-
+            raise ValueError(f"Symbol must be a class/interface, got: {node.kind}")
         query = InheritQuery(self.index)
-        result = query.execute(node.id, direction=direction, depth=depth, limit=limit)
+        result = query.execute(node.id, direction=args.get("direction", "up"), depth=args.get("depth", 1), limit=args.get("limit", 100))
 
-        def entry_to_dict(entry):
-            return {
-                "depth": entry.depth,
-                "kind": entry.kind,
-                "fqn": entry.fqn,
-                "file": entry.file,
-                "line": entry.line + 1 if entry.line is not None else None,
-                "children": [entry_to_dict(c) for c in entry.children],
-            }
+        def entry_to_dict(e):
+            return {"depth": e.depth, "kind": e.kind, "fqn": e.fqn, "file": e.file, "line": e.line + 1 if e.line else None, "children": [entry_to_dict(c) for c in e.children]}
 
-        return {
-            "root": {"fqn": node.fqn, "file": node.file},
-            "direction": result.direction,
-            "max_depth": result.max_depth,
-            "total": _count_tree_nodes(result.tree),
-            "tree": [entry_to_dict(e) for e in result.tree],
-        }
+        return {"root": {"fqn": node.fqn}, "direction": result.direction, "tree": [entry_to_dict(e) for e in result.tree]}
 
     def _handle_overrides(self, args: dict) -> dict:
-        """Handle kloc_overrides tool call."""
-        symbol = args.get("symbol")
-        direction = args.get("direction", "up")
-        depth = args.get("depth", 1)
-        limit = args.get("limit", 100)
-
-        if not symbol:
-            return {"error": "Missing required parameter: symbol"}
-
-        node, error = self._resolve_symbol(symbol)
-        if error:
-            return error
-
+        node = self._resolve_symbol(args["symbol"])
         if node.kind != "Method":
-            return {"error": f"Symbol must be a method, got: {node.kind}"}
-
+            raise ValueError(f"Symbol must be a method, got: {node.kind}")
         query = OverridesQuery(self.index)
-        result = query.execute(node.id, direction=direction, depth=depth, limit=limit)
+        result = query.execute(node.id, direction=args.get("direction", "up"), depth=args.get("depth", 1), limit=args.get("limit", 100))
 
-        def entry_to_dict(entry):
-            return {
-                "depth": entry.depth,
-                "fqn": entry.fqn,
-                "file": entry.file,
-                "line": entry.line + 1 if entry.line is not None else None,
-                "children": [entry_to_dict(c) for c in entry.children],
-            }
+        def entry_to_dict(e):
+            return {"depth": e.depth, "fqn": e.fqn, "file": e.file, "line": e.line + 1 if e.line else None, "children": [entry_to_dict(c) for c in e.children]}
 
-        return {
-            "root": {"fqn": node.fqn, "file": node.file},
-            "direction": result.direction,
-            "max_depth": result.max_depth,
-            "total": _count_tree_nodes(result.tree),
-            "tree": [entry_to_dict(e) for e in result.tree],
-        }
+        return {"root": {"fqn": node.fqn}, "direction": result.direction, "tree": [entry_to_dict(e) for e in result.tree]}
 
 
 def run_mcp_server(sot_path: str):
-    """Run the MCP server using stdio.
-
-    This implements a simple JSON-based MCP protocol over stdin/stdout.
-    """
+    """Run the MCP server using stdio with JSON-RPC 2.0 protocol."""
     server = MCPServer(sot_path)
 
-    # Print server info to stderr (for debugging)
-    print(f"KLOC MCP Server started with {sot_path}", file=sys.stderr)
-    print(f"Loaded {len(server.index.nodes)} nodes", file=sys.stderr)
+    def send_response(id: Any, result: Any = None, error: Any = None):
+        response = {"jsonrpc": "2.0", "id": id}
+        if error is not None:
+            response["error"] = {"code": -32000, "message": str(error)}
+        else:
+            response["result"] = result
+        print(json.dumps(response), flush=True)
 
-    # Process requests from stdin
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -527,33 +263,44 @@ def run_mcp_server(sot_path: str):
 
         try:
             request = json.loads(line)
-            method = request.get("method", "")
-
-            if method == "list_tools":
-                response = {"tools": server.get_tools()}
-            elif method == "call_tool":
-                tool_name = request.get("name", "")
-                arguments = request.get("arguments", {})
-                response = server.call_tool(tool_name, arguments)
-            else:
-                response = {"error": f"Unknown method: {method}"}
-
-            print(json.dumps(response), flush=True)
-
         except json.JSONDecodeError as e:
-            print(json.dumps({"error": f"Invalid JSON: {e}"}), flush=True)
+            send_response(None, error=f"Parse error: {e}")
+            continue
+
+        req_id = request.get("id")
+        method = request.get("method", "")
+        params = request.get("params", {})
+
+        try:
+            if method == "initialize":
+                send_response(req_id, {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "kloc-cli", "version": "0.2.0"}
+                })
+            elif method == "notifications/initialized":
+                pass  # No response needed for notifications
+            elif method == "tools/list":
+                send_response(req_id, {"tools": server.get_tools()})
+            elif method == "tools/call":
+                tool_name = params.get("name", "")
+                arguments = params.get("arguments", {})
+                result = server.call_tool(tool_name, arguments)
+                send_response(req_id, {"content": [{"type": "text", "text": json.dumps(result, indent=2)}]})
+            elif method == "ping":
+                send_response(req_id, {})
+            else:
+                send_response(req_id, error=f"Method not found: {method}")
         except Exception as e:
-            print(json.dumps({"error": str(e)}), flush=True)
+            send_response(req_id, error=str(e))
 
 
 def main():
-    """Main entry point for MCP server."""
+    """Main entry point."""
+    import argparse
     parser = argparse.ArgumentParser(description="KLOC MCP Server")
-    parser.add_argument(
-        "--sot", "-s", required=True, help="Path to SoT JSON file"
-    )
+    parser.add_argument("--sot", "-s", required=True, help="Path to SoT JSON file")
     args = parser.parse_args()
-
     run_mcp_server(args.sot)
 
 
