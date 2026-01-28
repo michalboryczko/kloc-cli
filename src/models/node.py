@@ -15,6 +15,7 @@ class NodeData:
     symbol: str
     file: Optional[str]
     range: Optional[dict]
+    enclosing_range: Optional[dict] = None
     documentation: list[str] = field(default_factory=list)
 
     @property

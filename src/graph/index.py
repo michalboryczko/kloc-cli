@@ -45,6 +45,7 @@ class SoTIndex:
                 symbol=n["symbol"],
                 file=n.get("file"),
                 range=n.get("range"),
+                enclosing_range=n.get("enclosing_range"),
                 documentation=n.get("documentation", []),
             )
             self.nodes[node.id] = node
