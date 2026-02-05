@@ -524,6 +524,9 @@ class ContextQuery(Query[ContextResult]):
 
         If include_impl is True, attach implementations for interfaces/methods
         with their dependencies expanded.
+
+        Reference types and access chains are resolved from the unified graph's
+        Call/Value nodes when available.
         """
         visited = {start_id}
         count = [0]  # Use list to allow mutation in nested function
@@ -559,6 +562,35 @@ class ContextQuery(Query[ContextResult]):
                     file = None
                     line = None
 
+                # Try to find a Call node for reference type and access chain
+                member_ref = None
+                if target_node:
+                    call_node_id = find_call_for_usage(
+                        self.index, current_id, target_id, file, line
+                    )
+
+                    reference_type = None
+                    access_chain = None
+
+                    if call_node_id:
+                        reference_type = get_reference_type_from_call(self.index, call_node_id)
+                        access_chain = build_access_chain(self.index, call_node_id)
+                    else:
+                        # Fall back to inference from edge/node types
+                        reference_type = _infer_reference_type(edge, target_node)
+
+                    # For USES, target_name is empty since fqn already shows the target
+                    # We only need reference_type and access_chain
+                    member_ref = MemberRef(
+                        target_name="",  # Empty - fqn already shows the target
+                        target_fqn=target_node.fqn,
+                        target_kind=target_node.kind,
+                        file=file,
+                        line=line,
+                        reference_type=reference_type,
+                        access_chain=access_chain,
+                    )
+
                 entry = ContextEntry(
                     depth=current_depth,
                     node_id=target_id,
@@ -569,6 +601,7 @@ class ContextQuery(Query[ContextResult]):
                     signature=target_node.signature if target_node else None,
                     children=[],
                     implementations=[],
+                    member_ref=member_ref,
                 )
 
                 # Attach implementations for interfaces/methods with their deps expanded
@@ -722,6 +755,34 @@ class ContextQuery(Query[ContextResult]):
                 file = None
                 line = None
 
+            # Try to find a Call node for reference type and access chain
+            member_ref = None
+            if target_node:
+                call_node_id = find_call_for_usage(
+                    self.index, start_id, target_id, file, line
+                )
+
+                reference_type = None
+                access_chain = None
+
+                if call_node_id:
+                    reference_type = get_reference_type_from_call(self.index, call_node_id)
+                    access_chain = build_access_chain(self.index, call_node_id)
+                else:
+                    # Fall back to inference from edge/node types
+                    reference_type = _infer_reference_type(edge, target_node)
+
+                # For USES, target_name is empty since fqn already shows the target
+                member_ref = MemberRef(
+                    target_name="",  # Empty - fqn already shows the target
+                    target_fqn=target_node.fqn,
+                    target_kind=target_node.kind,
+                    file=file,
+                    line=line,
+                    reference_type=reference_type,
+                    access_chain=access_chain,
+                )
+
             entry = ContextEntry(
                 depth=depth,
                 node_id=target_id,
@@ -732,6 +793,7 @@ class ContextQuery(Query[ContextResult]):
                 signature=target_node.signature if target_node else None,
                 children=[],
                 implementations=[],
+                member_ref=member_ref,
             )
 
             # Attach implementations for interfaces/methods
