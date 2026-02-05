@@ -1,7 +1,69 @@
 """Context query with BFS depth expansion and tree structure."""
 
-from ..models import ContextResult, ContextEntry, InheritEntry, OverrideEntry, NodeData
+from typing import Optional
+
+from ..models import ContextResult, ContextEntry, MemberRef, InheritEntry, OverrideEntry, NodeData
+from ..models.edge import EdgeData
 from .base import Query
+
+
+def _infer_reference_type(edge: EdgeData, target_node: Optional[NodeData]) -> str:
+    """Infer reference type from edge type and target node kind.
+
+    Without calls.json, we can only infer based on sot.json edge metadata.
+    This provides a best-effort classification that may be ambiguous in some cases.
+
+    Reference Type Inference Rules:
+    | Edge Type | Target Kind | Inferred Reference Type |
+    |-----------|-------------|------------------------|
+    | extends   | Class       | extends                |
+    | implements| Interface   | implements             |
+    | uses_trait| Trait       | uses_trait             |
+    | uses      | Method      | method_call (could be static) |
+    | uses      | Property    | property_access or type_hint |
+    | uses      | Class       | type_hint (could be instantiation) |
+
+    Args:
+        edge: The edge data from sot.json
+        target_node: The target node of the edge (if resolved)
+
+    Returns:
+        A reference type string (e.g., "method_call", "type_hint", "extends")
+    """
+    # Direct edge type mappings
+    if edge.type == "extends":
+        return "extends"
+    if edge.type == "implements":
+        return "implements"
+    if edge.type == "uses_trait":
+        return "uses_trait"
+
+    # For 'uses' edges, infer from target node kind
+    if edge.type == "uses" and target_node:
+        kind = target_node.kind
+        if kind == "Method":
+            # Could be method_call or static_call - can't distinguish without calls.json
+            return "method_call"
+        if kind == "Property":
+            # Could be property_access or type_hint for property declarations
+            return "property_access"
+        if kind in ("Class", "Interface", "Trait", "Enum"):
+            # Most common case is type_hint (parameter types, return types, property types)
+            # Could also be instantiation, but we can't distinguish without calls.json
+            return "type_hint"
+        if kind == "Constant":
+            return "constant_access"
+        if kind == "Function":
+            return "function_call"
+        if kind == "Argument":
+            # Usage of a method/function argument (parameter reference)
+            return "argument_ref"
+        if kind == "Variable":
+            # Local variable usage
+            return "variable_ref"
+
+    # Fallback for unknown edge types or missing target node
+    return "uses"
 
 
 class ContextQuery(Query[ContextResult]):
@@ -17,7 +79,8 @@ class ContextQuery(Query[ContextResult]):
     INHERITABLE_KINDS = {"Class", "Interface", "Trait", "Enum"}
 
     def execute(
-        self, node_id: str, depth: int = 1, limit: int = 100, include_impl: bool = False
+        self, node_id: str, depth: int = 1, limit: int = 100, include_impl: bool = False,
+        direct_only: bool = False, calls_data=None
     ) -> ContextResult:
         """Execute context query with BFS tree building.
 
@@ -28,6 +91,9 @@ class ContextQuery(Query[ContextResult]):
             include_impl: If True, enables polymorphic analysis:
                          - USES: attaches implementations/overrides for interfaces/methods
                          - USED BY: includes usages of interface methods that concrete methods implement
+            direct_only: If True, USED BY shows only direct references to the symbol itself,
+                        excluding usages that only reference its members.
+            calls_data: Optional CallsData instance for access chain resolution.
 
         Returns:
             ContextResult with tree structures for used_by and uses.
@@ -36,7 +102,7 @@ class ContextQuery(Query[ContextResult]):
         if not target_node:
             raise ValueError(f"Node not found: {node_id}")
 
-        used_by = self._build_incoming_tree(node_id, depth, limit, include_impl)
+        used_by = self._build_incoming_tree(node_id, depth, limit, include_impl, direct_only, calls_data)
         uses = self._build_outgoing_tree(node_id, depth, limit, include_impl)
 
         return ContextResult(
@@ -46,62 +112,162 @@ class ContextQuery(Query[ContextResult]):
             uses=uses,
         )
 
+    @staticmethod
+    def _member_display_name(node: NodeData) -> str:
+        """Format a short member display name: '$prop', 'method()', 'CONST'."""
+        if node.kind == "Method" or node.kind == "Function":
+            return f"{node.name}()"
+        if node.kind == "Property":
+            name = node.name
+            return name if name.startswith("$") else f"${name}"
+        return node.name
+
     def _build_incoming_tree(
-        self, start_id: str, max_depth: int, limit: int, include_impl: bool = False
+        self, start_id: str, max_depth: int, limit: int, include_impl: bool = False,
+        direct_only: bool = False, calls_data=None
     ) -> list[ContextEntry]:
         """Build nested tree for incoming usages (used_by).
 
+        Each usage edge becomes its own branch. When a source references multiple
+        members, each member reference is a separate entry showing the specific
+        member and reference location. Depth expansion (children) is only added
+        to the first entry per source to avoid duplication.
+
         If include_impl is True and the target is a method that implements an interface
         method, also include usages of that interface method grouped under the interface.
+
+        If direct_only is True, only show usages that directly reference the current node,
+        excluding usages that only reference its members.
+
+        If calls_data is provided, uses calls.json for authoritative reference types
+        and access chain building.
         """
         visited = {start_id}
-        count = [0]  # Use list to allow mutation in nested function
+        count = [0]  # Tracks unique sources for limit
 
         def build_tree(current_id: str, current_depth: int) -> list[ContextEntry]:
             if current_depth > max_depth or count[0] >= limit:
                 return []
 
+            # --- Pass 1: collect all entries, claim sources in visited ---
+            # This prevents deeper expansions from "stealing" sources that
+            # belong at the current depth.
             entries = []
-            edges = self.index.get_usages(current_id)
+            source_groups = self.index.get_usages_grouped(current_id)
 
-            for edge in edges:
-                source_id = edge.source
+            for source_id, edges in source_groups.items():
                 if source_id in visited:
                     continue
-                visited.add(source_id)
+
+                # Separate direct edges (target = current node) from member edges
+                direct_edges = [e for e in edges if e.target == current_id]
+                member_edges = [e for e in edges if e.target != current_id]
+
+                # In direct_only mode, skip sources that only have member edges
+                if direct_only and not direct_edges:
+                    continue
 
                 if count[0] >= limit:
                     break
                 count[0] += 1
+                visited.add(source_id)
 
                 source_node = self.index.nodes.get(source_id)
 
-                if edge.location:
-                    file = edge.location.get("file")
-                    line = edge.location.get("line")
-                elif source_node:
-                    file = source_node.file
-                    line = source_node.start_line
-                else:
-                    file = None
-                    line = None
-
-                entry = ContextEntry(
-                    depth=current_depth,
-                    node_id=source_id,
-                    fqn=source_node.fqn if source_node else source_id,
-                    kind=source_node.kind if source_node else None,
-                    file=file,
-                    line=line,
-                    signature=source_node.signature if source_node else None,
-                    children=[],
+                # Sort member edges by line for execution flow order
+                member_edges.sort(
+                    key=lambda e: e.location.get("line", 0) if e.location else 0
                 )
 
-                # Recurse for children
-                if current_depth < max_depth:
-                    entry.children = build_tree(source_id, current_depth + 1)
+                # Collect all edges to emit: direct edges first, then member edges
+                # In direct_only mode, skip member edges entirely
+                all_edges = direct_edges + ([] if direct_only else member_edges)
 
-                entries.append(entry)
+                for edge in all_edges:
+                    is_member = edge.target != current_id
+
+                    # Location from the edge itself
+                    if edge.location:
+                        file = edge.location.get("file")
+                        line = edge.location.get("line")
+                    elif source_node:
+                        file = source_node.file
+                        line = source_node.start_line
+                    else:
+                        file = None
+                        line = None
+
+                    # Build member_ref for member edges
+                    member_ref = None
+                    access_chain = None
+                    reference_type = None
+
+                    if is_member:
+                        target_node = self.index.nodes.get(edge.target)
+                        if target_node:
+                            # Try to get call record from calls_data for authoritative info
+                            call_record = None
+                            if calls_data and file and line is not None:
+                                # calls.json uses 1-based lines, sot.json uses 0-based
+                                # Use target_node.symbol to disambiguate multiple calls on same line
+                                call_record = calls_data.get_call_at(
+                                    file, line + 1, callee=target_node.symbol
+                                )
+
+                            # Get reference type - prefer calls_data if available
+                            if call_record:
+                                reference_type = calls_data.get_reference_type(call_record)
+                                access_chain = calls_data.build_chain_for_callee(call_record)
+                            else:
+                                reference_type = _infer_reference_type(edge, target_node)
+
+                            member_ref = MemberRef(
+                                target_name=self._member_display_name(target_node),
+                                target_fqn=target_node.fqn,
+                                target_kind=target_node.kind,
+                                file=file,
+                                line=line,
+                                reference_type=reference_type,
+                                access_chain=access_chain,
+                            )
+                    else:
+                        # Direct reference to the target node itself
+                        # Infer reference type for direct edges (extends, implements, type_hint)
+                        target_node = self.index.nodes.get(edge.target)
+                        reference_type = _infer_reference_type(edge, target_node)
+                        # For direct edges, create a member_ref to hold the reference_type
+                        # even though it's not a member reference
+                        member_ref = MemberRef(
+                            target_name="",  # No specific member
+                            target_fqn=target_node.fqn if target_node else edge.target,
+                            target_kind=target_node.kind if target_node else None,
+                            file=file,
+                            line=line,
+                            reference_type=reference_type,
+                        )
+
+                    entry = ContextEntry(
+                        depth=current_depth,
+                        node_id=source_id,
+                        fqn=source_node.fqn if source_node else source_id,
+                        kind=source_node.kind if source_node else None,
+                        file=file,
+                        line=line,
+                        signature=source_node.signature if source_node else None,
+                        children=[],
+                        member_ref=member_ref,
+                    )
+                    entries.append(entry)
+
+            # --- Pass 2: expand children for first entry per source ---
+            # Done after all current-depth entries are claimed, so child
+            # expansion can't steal siblings.
+            if current_depth < max_depth:
+                expanded = set()
+                for entry in entries:
+                    if entry.node_id not in expanded:
+                        expanded.add(entry.node_id)
+                        entry.children = build_tree(entry.node_id, current_depth + 1)
 
             return entries
 

@@ -173,11 +173,22 @@ def print_context_tree(result: ContextResult, console: Console):
                 continue
 
             display_name = _format_entry_name(entry)
-            label = f"[dim][{entry.depth}][/dim] {display_name}"
+            label = f"[dim]\\[{entry.depth}][/dim] {display_name}"
+            # Append member ref inline: "source -> member [reference_type]"
+            if entry.member_ref:
+                # For member references, show the member name
+                if entry.member_ref.target_name:
+                    label += f" [bold yellow]->[/bold yellow] [yellow]{entry.member_ref.target_name}[/yellow]"
+                # Add reference type indicator (escape brackets for Rich)
+                if entry.member_ref.reference_type:
+                    label += f" [cyan]\\[{entry.member_ref.reference_type}][/cyan]"
             if entry.file and entry.line is not None:
                 label += f" [dim]({entry.file}:{entry.line + 1})[/dim]"
             elif entry.file:
                 label += f" [dim]({entry.file})[/dim]"
+            # Add access chain on a new line if present
+            if entry.member_ref and entry.member_ref.access_chain:
+                label += f"\n        [dim]on:[/dim] [green]{entry.member_ref.access_chain}[/green]"
 
             branch = parent.add(label)
 
@@ -249,6 +260,22 @@ def context_tree_to_dict(result: ContextResult) -> dict:
         # Include via_interface flag if set (USED BY direction)
         if entry.via_interface:
             d["via_interface"] = True
+        # Include member reference (what specific member is used)
+        if entry.member_ref:
+            member_ref_dict = {
+                "target_name": entry.member_ref.target_name,
+                "target_fqn": entry.member_ref.target_fqn,
+                "target_kind": entry.member_ref.target_kind,
+                "file": entry.member_ref.file,
+                "line": entry.member_ref.line + 1 if entry.member_ref.line is not None else None,
+            }
+            # Include reference_type if present
+            if entry.member_ref.reference_type:
+                member_ref_dict["reference_type"] = entry.member_ref.reference_type
+            # Include access_chain if present (from calls.json)
+            if entry.member_ref.access_chain:
+                member_ref_dict["access_chain"] = entry.member_ref.access_chain
+            d["member_ref"] = member_ref_dict
         return d
 
     target_dict = {

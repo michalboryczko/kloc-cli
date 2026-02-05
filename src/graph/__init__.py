@@ -4,6 +4,7 @@ from .index import SoTIndex
 from .loader import load_sot
 from .precompute import PrecomputedGraph
 from .trie import SymbolTrie, build_symbol_trie
+from .calls import CallsData
 
 __all__ = [
     "SoTIndex",
@@ -11,4 +12,5 @@ __all__ = [
     "PrecomputedGraph",
     "SymbolTrie",
     "build_symbol_trie",
+    "CallsData",
 ]

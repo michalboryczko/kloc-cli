@@ -86,6 +86,26 @@ class DepsResult:
 
 
 @dataclass
+class MemberRef:
+    """A specific member usage reference within a USES relationship.
+
+    When a source uses members of a class (properties, methods), each reference
+    is captured here so the output shows the execution flow - what specific
+    members are accessed and where.
+    """
+
+    target_name: str  # Short display name: "$prop", "method()"
+    target_fqn: str  # Full FQN: "App\\Foo::method()"
+    target_kind: Optional[str] = None  # "Method", "Property", etc.
+    file: Optional[str] = None  # Where the reference occurs
+    line: Optional[int] = None  # Line of the reference (0-indexed)
+    # NEW: Reference type classification
+    reference_type: Optional[str] = None  # "method_call", "type_hint", "instantiation", etc.
+    # NEW: Access chain showing receiver expression (requires calls.json)
+    access_chain: Optional[str] = None  # "$this->orderRepository" or None
+
+
+@dataclass
 class ContextEntry:
     """Single entry in context tree (used_by or uses)."""
 
@@ -102,6 +122,9 @@ class ContextEntry:
     # For concrete methods: marks this as an interface method grouping (USED BY direction)
     # When True, this entry represents an interface method and children are usages via that interface
     via_interface: bool = False
+    # When this entry represents a member usage (not direct class usage),
+    # member_ref identifies which specific member is being referenced
+    member_ref: Optional["MemberRef"] = None
 
 
 @dataclass

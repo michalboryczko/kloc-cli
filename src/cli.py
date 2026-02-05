@@ -220,21 +220,40 @@ def deps(
 def context(
     symbol: str = typer.Argument(..., help="Symbol to get context for"),
     sot: str = typer.Option(..., "--sot", "-s", help="Path to SoT JSON"),
+    calls: Optional[Path] = typer.Option(None, "--calls", "-c", help="Path to calls.json for access chain display"),
     depth: int = typer.Option(1, "--depth", "-d", help="BFS depth for expansion"),
     limit: int = typer.Option(100, "--limit", "-l", help="Maximum results per direction"),
     impl: bool = typer.Option(False, "--impl", "-i", help="Include implementations/overrides"),
+    direct: bool = typer.Option(False, "--direct", help="Show only direct symbol references (no member usages)"),
     json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
 ):
     """Get combined usages and dependencies with depth expansion.
+
+    With --calls flag:
+    - Enables access chain display for method calls (e.g., "on: $this->repo")
+    - Provides authoritative reference types from call records
 
     With --impl flag (polymorphic analysis):
     - USES direction: includes implementations of interfaces and overriding methods
     - USED BY direction: includes usages of interface methods that concrete methods implement
 
+    With --direct flag:
+    - USED BY direction: shows only direct references to the symbol itself (extends,
+      implements, type hints), excluding usages that only reference its members
+
     Example: When querying a concrete method that implements an interface method,
     --impl will also show callers that use the interface method, not just direct callers.
     """
     index = get_index(sot)
+
+    # Load calls data if provided
+    calls_data = None
+    if calls:
+        if not calls.exists():
+            console.print(f"[red]Error: calls.json not found: {calls}[/red]")
+            raise typer.Exit(1)
+        from .graph import CallsData
+        calls_data = CallsData.load(calls)
 
     resolve_query = ResolveQuery(index)
     resolve_result = resolve_query.execute(symbol)
@@ -252,7 +271,10 @@ def context(
 
     node = resolve_result.candidates[0]
     context_query = ContextQuery(index)
-    result = context_query.execute(node.id, depth=depth, limit=limit, include_impl=impl)
+    result = context_query.execute(
+        node.id, depth=depth, limit=limit, include_impl=impl, direct_only=direct,
+        calls_data=calls_data
+    )
 
     if json_output:
         print_json(context_tree_to_dict(result))

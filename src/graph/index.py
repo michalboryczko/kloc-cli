@@ -220,6 +220,35 @@ class SoTIndex:
 
         return direct_usages
 
+    def get_usages_grouped(self, node_id: str) -> dict[str, list[EdgeData]]:
+        """Get all incoming uses edges for a node and its members, grouped by source.
+
+        Unlike get_usages(), does NOT deduplicate by source - returns all edges
+        so callers can see every member reference from each source.
+
+        Returns:
+            Dict mapping source_id -> list of EdgeData (may target the node
+            itself or any of its contained members).
+        """
+        grouped: dict[str, list[EdgeData]] = defaultdict(list)
+
+        # Direct usages of the node itself
+        for edge in self.incoming[node_id].get("uses", []):
+            grouped[edge.source].append(edge)
+
+        # Member usages (for container types)
+        node = self.nodes.get(node_id)
+        if node and node.kind in ("Class", "Interface", "Trait", "Enum", "File"):
+            def collect_member_edges(parent_id: str):
+                for child_id in self.get_contains_children(parent_id):
+                    for edge in self.incoming[child_id].get("uses", []):
+                        grouped[edge.source].append(edge)
+                    collect_member_edges(child_id)
+
+            collect_member_edges(node_id)
+
+        return dict(grouped)
+
     def get_deps(self, node_id: str, include_members: bool = True) -> list[EdgeData]:
         """Get all outgoing 'uses' edges from a node.
 
