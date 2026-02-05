@@ -232,9 +232,24 @@ class ContextQuery(Query[ContextResult]):
                             )
                     else:
                         # Direct reference to the target node itself
-                        # Infer reference type for direct edges (extends, implements, type_hint)
+                        # Check calls_data for constructor calls (instantiation)
                         target_node = self.index.nodes.get(edge.target)
-                        reference_type = _infer_reference_type(edge, target_node)
+
+                        # Try to get constructor call from calls_data for authoritative info
+                        constructor_record = None
+                        if calls_data and file and line is not None and target_node:
+                            # calls.json uses 1-based lines, sot.json uses 0-based
+                            constructor_record = calls_data.get_constructor_at(
+                                file, line + 1, class_symbol=target_node.symbol
+                            )
+
+                        # Get reference type - prefer calls_data if constructor found
+                        if constructor_record:
+                            reference_type = calls_data.get_reference_type(constructor_record)
+                        else:
+                            # Infer reference type for direct edges (extends, implements, type_hint)
+                            reference_type = _infer_reference_type(edge, target_node)
+
                         # For direct edges, create a member_ref to hold the reference_type
                         # even though it's not a member reference
                         member_ref = MemberRef(

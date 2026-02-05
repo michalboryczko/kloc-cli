@@ -135,3 +135,41 @@ class TestReferenceType:
         assert call is not None
         ref_type = calls_data.get_reference_type(call)
         assert ref_type == "property_access"
+
+
+class TestGetConstructorAt:
+    """Tests for get_constructor_at() constructor lookup."""
+
+    def test_get_constructor_at_order(self, calls_data):
+        """Find constructor call at OrderService.php line 31 (new Order())."""
+        call = calls_data.get_constructor_at(
+            "src/Service/OrderService.php", 31,
+            class_symbol="App/Entity/Order"
+        )
+        assert call is not None
+        assert call.kind == "constructor"
+        assert "Order#__construct" in call.callee
+
+    def test_get_constructor_at_without_filter(self, calls_data):
+        """Find any constructor at a line without class filter."""
+        # Line 37 has new DateTimeImmutable()
+        call = calls_data.get_constructor_at(
+            "src/Service/OrderService.php", 37
+        )
+        assert call is not None
+        assert call.kind == "constructor"
+
+    def test_get_constructor_at_nonexistent(self, calls_data):
+        """Returns None when no constructor at location."""
+        call = calls_data.get_constructor_at(
+            "src/Service/OrderService.php", 40  # This line has method call, not constructor
+        )
+        assert call is None
+
+    def test_get_constructor_at_wrong_class(self, calls_data):
+        """Returns None when class symbol doesn't match."""
+        call = calls_data.get_constructor_at(
+            "src/Service/OrderService.php", 31,
+            class_symbol="NonExistent/Class"
+        )
+        assert call is None

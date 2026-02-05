@@ -127,6 +127,41 @@ class TestAccessChains:
         # If no instantiation found in used_by, that's also acceptable
         # (depends on edge representation)
 
+    def test_tc8_direct_class_instantiation(self, index, calls_data):
+        """TC8: Direct class reference shows [instantiation] for constructor calls.
+
+        QA TC8: Query "App\\Entity\\Order" should show:
+        [1] App\\Service\\OrderService::createOrder() [instantiation]
+            (src/Service/OrderService.php:31)
+
+        This tests that direct references to a class (not to its members) correctly
+        detect constructor calls in calls.json and report 'instantiation' instead of
+        defaulting to 'type_hint'.
+        """
+        # Query Order entity
+        node = index.resolve_symbol("App\\Entity\\Order")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1, calls_data=calls_data)
+
+        # Find the OrderService::createOrder() entry at line 31 (constructor call)
+        instantiation_entry = None
+        for entry in result.used_by:
+            if "OrderService::createOrder" in entry.fqn:
+                if entry.member_ref and entry.member_ref.line == 30:  # 0-based line
+                    instantiation_entry = entry
+                    break
+
+        assert instantiation_entry is not None, (
+            "OrderService::createOrder() at line 31 should be in used_by"
+        )
+        assert instantiation_entry.member_ref is not None
+        assert instantiation_entry.member_ref.reference_type == "instantiation", (
+            f"Expected reference_type 'instantiation' but got "
+            f"'{instantiation_entry.member_ref.reference_type}'"
+        )
+        # Constructor calls should have no access chain (no receiver)
+        assert instantiation_entry.member_ref.access_chain is None
+
 
 class TestMultipleReferences:
     """Tests for multiple reference handling (TC6)."""

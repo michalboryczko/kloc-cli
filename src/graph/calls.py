@@ -398,3 +398,36 @@ class CallsData:
             Reference type string like "method_call", "static_call", etc.
         """
         return CALL_KIND_TO_REFERENCE_TYPE.get(call.kind, "unknown")
+
+    def get_constructor_at(
+        self, file: str, line: int, class_symbol: Optional[str] = None
+    ) -> Optional[CallRecord]:
+        """Find constructor call at location, optionally matching class symbol.
+
+        This is used to detect `new ClassName()` instantiation at a given location.
+        The class_symbol can be the full SCIP symbol or just a partial match.
+
+        Args:
+            file: Source file path (relative to project root).
+            line: Line number (1-based, as in calls.json).
+            class_symbol: Optional class symbol to match in return_type.
+
+        Returns:
+            Matching constructor CallRecord or None if not found.
+        """
+        loc_key = f"{file}:{line}"
+        calls = self.calls_by_location.get(loc_key, [])
+
+        for c in calls:
+            if c.kind != "constructor":
+                continue
+
+            # If no class_symbol filter, return first constructor
+            if class_symbol is None:
+                return c
+
+            # Match class symbol against return_type (the instantiated class)
+            if c.return_type and class_symbol in c.return_type:
+                return c
+
+        return None
