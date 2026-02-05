@@ -430,22 +430,24 @@ class ContextQuery(Query[ContextResult]):
                         # Direct reference to the target node itself
                         target_node = self.index.nodes.get(edge.target)
 
-                        # Try to find a constructor Call node in the graph
+                        # Try to find a Call node in the graph
                         call_node_id = None
                         if file and line is not None and target_node:
                             call_node_id = find_call_for_usage(
                                 self.index, source_id, edge.target, file, line
                             )
 
-                        # Get reference type from Call node (e.g., constructor -> instantiation)
+                        # Get reference type and access chain from Call node
+                        access_chain = None
                         if call_node_id:
                             reference_type = get_reference_type_from_call(self.index, call_node_id)
+                            access_chain = build_access_chain(self.index, call_node_id)
                         else:
                             # Infer reference type for direct edges (extends, implements, type_hint)
                             reference_type = _infer_reference_type(edge, target_node)
 
                         # For direct edges, create a member_ref to hold the reference_type
-                        # even though it's not a member reference
+                        # and access_chain
                         member_ref = MemberRef(
                             target_name="",  # No specific member
                             target_fqn=target_node.fqn if target_node else edge.target,
@@ -453,6 +455,7 @@ class ContextQuery(Query[ContextResult]):
                             file=file,
                             line=line,
                             reference_type=reference_type,
+                            access_chain=access_chain,
                         )
 
                     entry = ContextEntry(
