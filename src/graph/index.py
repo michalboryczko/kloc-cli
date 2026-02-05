@@ -47,6 +47,10 @@ class SoTIndex:
                 range=n.get("range"),
                 enclosing_range=n.get("enclosing_range"),
                 documentation=n.get("documentation", []),
+                # v2.0 fields
+                value_kind=n.get("value_kind"),
+                type_symbol=n.get("type_symbol"),
+                call_kind=n.get("call_kind"),
             )
             self.nodes[node.id] = node
 
@@ -57,6 +61,7 @@ class SoTIndex:
                 source=e["source"],
                 target=e["target"],
                 location=e.get("location"),
+                position=e.get("position"),
             )
             self.edges.append(edge)
 
@@ -394,3 +399,63 @@ class SoTIndex:
             path.append(parent)
             current = parent
         return list(reversed(path))
+
+    # =========================================================================
+    # v2.0 Edge Query Methods (Value/Call graph traversal)
+    # =========================================================================
+
+    def get_receiver(self, call_node_id: str) -> Optional[str]:
+        """Get the receiver Value node ID for a Call node."""
+        edges = self.outgoing[call_node_id].get("receiver", [])
+        if edges:
+            return edges[0].target
+        return None
+
+    def get_call_target(self, call_node_id: str) -> Optional[str]:
+        """Get the target (callee) node ID for a Call node."""
+        edges = self.outgoing[call_node_id].get("calls", [])
+        if edges:
+            return edges[0].target
+        return None
+
+    def get_produces(self, call_node_id: str) -> Optional[str]:
+        """Get the result Value node ID produced by a Call node."""
+        edges = self.outgoing[call_node_id].get("produces", [])
+        if edges:
+            return edges[0].target
+        return None
+
+    def get_source_call(self, value_node_id: str) -> Optional[str]:
+        """Get the Call node ID that produced this Value node (via produces edge)."""
+        edges = self.incoming[value_node_id].get("produces", [])
+        if edges:
+            return edges[0].source
+        return None
+
+    def get_assigned_from(self, value_node_id: str) -> Optional[str]:
+        """Get the source Value node ID for a value assignment."""
+        edges = self.outgoing[value_node_id].get("assigned_from", [])
+        if edges:
+            return edges[0].target
+        return None
+
+    def get_type_of(self, value_node_id: str) -> Optional[str]:
+        """Get the type (Class/Interface) node ID for a Value node."""
+        edges = self.outgoing[value_node_id].get("type_of", [])
+        if edges:
+            return edges[0].target
+        return None
+
+    def get_calls_to(self, target_node_id: str) -> list[str]:
+        """Get all Call node IDs that call a given Method/Property/Class."""
+        return [e.source for e in self.incoming[target_node_id].get("calls", [])]
+
+    def get_arguments(self, call_node_id: str) -> list[tuple[str, int]]:
+        """Get argument Value node IDs with their positions for a Call node.
+
+        Returns:
+            List of (value_node_id, position) tuples sorted by position.
+        """
+        edges = self.outgoing[call_node_id].get("argument", [])
+        args = [(e.target, e.position or 0) for e in edges]
+        return sorted(args, key=lambda x: x[1])

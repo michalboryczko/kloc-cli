@@ -18,6 +18,13 @@ class NodeData:
     enclosing_range: Optional[dict] = None
     documentation: list[str] = field(default_factory=list)
 
+    # Value node fields (only set when kind == "Value")
+    value_kind: Optional[str] = None    # "parameter", "local", "result", "literal", "constant"
+    type_symbol: Optional[str] = None   # SCIP symbol of the value's type
+
+    # Call node fields (only set when kind == "Call")
+    call_kind: Optional[str] = None     # "method", "method_static", "constructor", "access", "access_static", "function"
+
     @property
     def start_line(self) -> Optional[int]:
         if self.range:

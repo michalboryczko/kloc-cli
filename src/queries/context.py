@@ -1,10 +1,210 @@
 """Context query with BFS depth expansion and tree structure."""
 
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from ..models import ContextResult, ContextEntry, MemberRef, InheritEntry, OverrideEntry, NodeData
 from ..models.edge import EdgeData
 from .base import Query
+
+if TYPE_CHECKING:
+    from ..graph import SoTIndex
+
+
+# =============================================================================
+# Graph-based Access Chain Building
+# =============================================================================
+
+def build_access_chain(index: "SoTIndex", call_node_id: str, max_depth: int = 10) -> Optional[str]:
+    """Build access chain string by traversing receiver edges in the graph.
+
+    For a call like `$this->orderRepository->save()`, traverses receiver edges
+    to build the chain "$this->orderRepository".
+
+    Args:
+        index: The SoT index with graph data.
+        call_node_id: ID of the Call node.
+        max_depth: Maximum traversal depth to prevent infinite loops.
+
+    Returns:
+        Access chain string like "$this->orderRepository" or None if no receiver.
+    """
+    call_node = index.nodes.get(call_node_id)
+    if not call_node or call_node.kind != "Call":
+        return None
+
+    receiver_id = index.get_receiver(call_node_id)
+    if not receiver_id:
+        return None  # Static call or constructor
+
+    return _build_chain_from_value(index, receiver_id, max_depth)
+
+
+def _build_chain_from_value(index: "SoTIndex", value_id: str, max_depth: int) -> str:
+    """Build chain by following value references.
+
+    Args:
+        index: The SoT index.
+        value_id: Starting value node ID.
+        max_depth: Maximum recursion depth.
+
+    Returns:
+        Chain string like "$this->repo" or "$param" or "?".
+    """
+    if max_depth <= 0:
+        return "?"
+
+    value_node = index.nodes.get(value_id)
+    if not value_node or value_node.kind != "Value":
+        return "?"
+
+    value_kind = value_node.value_kind
+
+    if value_kind == "parameter":
+        # Return the parameter name
+        return value_node.name
+
+    if value_kind == "local":
+        # Return the local variable name
+        return value_node.name
+
+    if value_kind == "result":
+        # Result of a call - follow to source call
+        source_call_id = index.get_source_call(value_id)
+        if source_call_id:
+            source_call = index.nodes.get(source_call_id)
+            if source_call and source_call.kind == "Call":
+                # Get the method/property name being accessed
+                target_id = index.get_call_target(source_call_id)
+                target_node = index.nodes.get(target_id) if target_id else None
+                member_name = target_node.name if target_node else "?"
+                # Strip $ from property names if present
+                if member_name.startswith("$"):
+                    member_name = member_name[1:]
+
+                # For property access, format as chain
+                if source_call.call_kind == "access":
+                    # Recurse to get receiver chain
+                    receiver_id = index.get_receiver(source_call_id)
+                    if receiver_id:
+                        receiver_chain = _build_chain_from_value(index, receiver_id, max_depth - 1)
+                        return f"{receiver_chain}->{member_name}"
+                    # No receiver - this is $this-> access (implicit receiver in PHP)
+                    return f"$this->{member_name}"
+
+                # For method calls, show as method()
+                if source_call.call_kind in ("method", "method_static"):
+                    receiver_id = index.get_receiver(source_call_id)
+                    if receiver_id:
+                        receiver_chain = _build_chain_from_value(index, receiver_id, max_depth - 1)
+                        return f"{receiver_chain}->{member_name}()"
+                    # No receiver - this is $this-> method call
+                    return f"$this->{member_name}()"
+
+        return "?"
+
+    if value_kind == "literal":
+        return "(literal)"
+
+    if value_kind == "constant":
+        return value_node.name
+
+    return "?"
+
+
+def get_reference_type_from_call(index: "SoTIndex", call_node_id: str) -> str:
+    """Get reference type from a Call node's call_kind.
+
+    Maps call_kind to human-readable reference types.
+    """
+    call_node = index.nodes.get(call_node_id)
+    if not call_node or call_node.kind != "Call":
+        return "unknown"
+
+    kind_map = {
+        "method": "method_call",
+        "method_static": "static_call",
+        "constructor": "instantiation",
+        "access": "property_access",
+        "access_static": "static_property",
+        "function": "function_call",
+    }
+    return kind_map.get(call_node.call_kind or "", "unknown")
+
+
+def find_call_for_usage(index: "SoTIndex", source_id: str, target_id: str, file: Optional[str], line: Optional[int]) -> Optional[str]:
+    """Find a Call node that matches a usage edge's location.
+
+    Args:
+        index: The SoT index.
+        source_id: Source node ID of the usage.
+        target_id: Target node ID of the usage.
+        file: File path from the edge location.
+        line: Line number from the edge location (0-based).
+
+    Returns:
+        Call node ID if found, None otherwise.
+    """
+    # Get all calls that target this node
+    calls = index.get_calls_to(target_id)
+
+    # Also check if there are Call nodes contained by the source
+    source_children = index.get_contains_children(source_id)
+    call_children = [c for c in source_children if index.nodes.get(c) and index.nodes[c].kind == "Call"]
+
+    # Filter by location if provided
+    if file and line is not None:
+        for call_id in calls + call_children:
+            call_node = index.nodes.get(call_id)
+            if call_node and call_node.file == file:
+                if call_node.range:
+                    call_line = call_node.range.get("start_line", -1)
+                    if call_line == line:
+                        return call_id
+
+    # If no location match, try to find any call from source to target
+    for call_id in calls:
+        call_node = index.nodes.get(call_id)
+        if call_node:
+            # Check if this call is contained in the source
+            container_id = index.get_contains_parent(call_id)
+            if container_id == source_id:
+                return call_id
+
+    return None
+
+
+def get_containing_scope(index: "SoTIndex", call_node_id: str) -> Optional[str]:
+    """Get the containing method/function for a Call node.
+
+    Traverses the containment hierarchy to find the Method or Function
+    that contains this call.
+
+    Args:
+        index: The SoT index.
+        call_node_id: ID of the Call node.
+
+    Returns:
+        Node ID of the containing Method/Function, or None if not found.
+    """
+    current_id = call_node_id
+    max_depth = 10  # Prevent infinite loops
+
+    for _ in range(max_depth):
+        parent_id = index.get_contains_parent(current_id)
+        if not parent_id:
+            return None
+
+        parent_node = index.nodes.get(parent_id)
+        if not parent_node:
+            return None
+
+        if parent_node.kind in ("Method", "Function"):
+            return parent_id
+
+        # Continue up the hierarchy
+        current_id = parent_id
+
+    return None
 
 
 def _infer_reference_type(edge: EdgeData, target_node: Optional[NodeData]) -> str:
@@ -80,7 +280,7 @@ class ContextQuery(Query[ContextResult]):
 
     def execute(
         self, node_id: str, depth: int = 1, limit: int = 100, include_impl: bool = False,
-        direct_only: bool = False, calls_data=None
+        direct_only: bool = False
     ) -> ContextResult:
         """Execute context query with BFS tree building.
 
@@ -93,7 +293,6 @@ class ContextQuery(Query[ContextResult]):
                          - USED BY: includes usages of interface methods that concrete methods implement
             direct_only: If True, USED BY shows only direct references to the symbol itself,
                         excluding usages that only reference its members.
-            calls_data: Optional CallsData instance for access chain resolution.
 
         Returns:
             ContextResult with tree structures for used_by and uses.
@@ -102,7 +301,7 @@ class ContextQuery(Query[ContextResult]):
         if not target_node:
             raise ValueError(f"Node not found: {node_id}")
 
-        used_by = self._build_incoming_tree(node_id, depth, limit, include_impl, direct_only, calls_data)
+        used_by = self._build_incoming_tree(node_id, depth, limit, include_impl, direct_only)
         uses = self._build_outgoing_tree(node_id, depth, limit, include_impl)
 
         return ContextResult(
@@ -124,7 +323,7 @@ class ContextQuery(Query[ContextResult]):
 
     def _build_incoming_tree(
         self, start_id: str, max_depth: int, limit: int, include_impl: bool = False,
-        direct_only: bool = False, calls_data=None
+        direct_only: bool = False
     ) -> list[ContextEntry]:
         """Build nested tree for incoming usages (used_by).
 
@@ -139,8 +338,8 @@ class ContextQuery(Query[ContextResult]):
         If direct_only is True, only show usages that directly reference the current node,
         excluding usages that only reference its members.
 
-        If calls_data is provided, uses calls.json for authoritative reference types
-        and access chain building.
+        Reference types and access chains are resolved from the unified graph's
+        Call/Value nodes when available.
         """
         visited = {start_id}
         count = [0]  # Tracks unique sources for limit
@@ -205,20 +404,17 @@ class ContextQuery(Query[ContextResult]):
                     if is_member:
                         target_node = self.index.nodes.get(edge.target)
                         if target_node:
-                            # Try to get call record from calls_data for authoritative info
-                            call_record = None
-                            if calls_data and file and line is not None:
-                                # calls.json uses 1-based lines, sot.json uses 0-based
-                                # Use target_node.symbol to disambiguate multiple calls on same line
-                                call_record = calls_data.get_call_at(
-                                    file, line + 1, callee=target_node.symbol
-                                )
+                            # Try to find a Call node in the graph for authoritative info
+                            call_node_id = find_call_for_usage(
+                                self.index, source_id, edge.target, file, line
+                            )
 
-                            # Get reference type - prefer calls_data if available
-                            if call_record:
-                                reference_type = calls_data.get_reference_type(call_record)
-                                access_chain = calls_data.build_chain_for_callee(call_record)
+                            # Get reference type and access chain from Call node if found
+                            if call_node_id:
+                                reference_type = get_reference_type_from_call(self.index, call_node_id)
+                                access_chain = build_access_chain(self.index, call_node_id)
                             else:
+                                # Fall back to inference from edge/node types
                                 reference_type = _infer_reference_type(edge, target_node)
 
                             member_ref = MemberRef(
@@ -232,20 +428,18 @@ class ContextQuery(Query[ContextResult]):
                             )
                     else:
                         # Direct reference to the target node itself
-                        # Check calls_data for constructor calls (instantiation)
                         target_node = self.index.nodes.get(edge.target)
 
-                        # Try to get constructor call from calls_data for authoritative info
-                        constructor_record = None
-                        if calls_data and file and line is not None and target_node:
-                            # calls.json uses 1-based lines, sot.json uses 0-based
-                            constructor_record = calls_data.get_constructor_at(
-                                file, line + 1, class_symbol=target_node.symbol
+                        # Try to find a constructor Call node in the graph
+                        call_node_id = None
+                        if file and line is not None and target_node:
+                            call_node_id = find_call_for_usage(
+                                self.index, source_id, edge.target, file, line
                             )
 
-                        # Get reference type - prefer calls_data if constructor found
-                        if constructor_record:
-                            reference_type = calls_data.get_reference_type(constructor_record)
+                        # Get reference type from Call node (e.g., constructor -> instantiation)
+                        if call_node_id:
+                            reference_type = get_reference_type_from_call(self.index, call_node_id)
                         else:
                             # Infer reference type for direct edges (extends, implements, type_hint)
                             reference_type = _infer_reference_type(edge, target_node)

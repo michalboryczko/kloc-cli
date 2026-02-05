@@ -220,7 +220,6 @@ def deps(
 def context(
     symbol: str = typer.Argument(..., help="Symbol to get context for"),
     sot: str = typer.Option(..., "--sot", "-s", help="Path to SoT JSON"),
-    calls: Optional[Path] = typer.Option(None, "--calls", "-c", help="Path to calls.json for access chain display"),
     depth: int = typer.Option(1, "--depth", "-d", help="BFS depth for expansion"),
     limit: int = typer.Option(100, "--limit", "-l", help="Maximum results per direction"),
     impl: bool = typer.Option(False, "--impl", "-i", help="Include implementations/overrides"),
@@ -229,9 +228,7 @@ def context(
 ):
     """Get combined usages and dependencies with depth expansion.
 
-    With --calls flag:
-    - Enables access chain display for method calls (e.g., "on: $this->repo")
-    - Provides authoritative reference types from call records
+    Access chains are computed from the graph when sot.json v2.0 contains Value/Call nodes.
 
     With --impl flag (polymorphic analysis):
     - USES direction: includes implementations of interfaces and overriding methods
@@ -245,15 +242,6 @@ def context(
     --impl will also show callers that use the interface method, not just direct callers.
     """
     index = get_index(sot)
-
-    # Load calls data if provided
-    calls_data = None
-    if calls:
-        if not calls.exists():
-            console.print(f"[red]Error: calls.json not found: {calls}[/red]")
-            raise typer.Exit(1)
-        from .graph import CallsData
-        calls_data = CallsData.load(calls)
 
     resolve_query = ResolveQuery(index)
     resolve_result = resolve_query.execute(symbol)
@@ -272,8 +260,7 @@ def context(
     node = resolve_result.candidates[0]
     context_query = ContextQuery(index)
     result = context_query.execute(
-        node.id, depth=depth, limit=limit, include_impl=impl, direct_only=direct,
-        calls_data=calls_data
+        node.id, depth=depth, limit=limit, include_impl=impl, direct_only=direct
     )
 
     if json_output:
