@@ -193,6 +193,16 @@ def print_context_tree(result: ContextResult, console: Console):
                 if entry.member_ref.access_chain_symbol:
                     chain_text += f" ({entry.member_ref.access_chain_symbol})"
                 label += f"\n        [dim]on:[/dim] [green]{chain_text}[/green]"
+            # Show argument-to-parameter mappings if present
+            if entry.arguments:
+                label += "\n        [dim]args:[/dim]"
+                for arg in entry.arguments:
+                    param = arg.param_name or f"arg[{arg.position}]"
+                    value = arg.value_expr or "?"
+                    label += f"\n          {param} <- {value}"
+            # Show result variable if present
+            if entry.result_var:
+                label += f"\n        [dim]result ->[/dim] [green]{entry.result_var}[/green]"
 
             branch = parent.add(label)
 
@@ -283,6 +293,20 @@ def context_tree_to_dict(result: ContextResult) -> dict:
             if entry.member_ref.access_chain_symbol:
                 member_ref_dict["access_chain_symbol"] = entry.member_ref.access_chain_symbol
             d["member_ref"] = member_ref_dict
+        # Include arguments if present
+        if entry.arguments:
+            d["arguments"] = [
+                {
+                    "position": a.position,
+                    "param_name": a.param_name,
+                    "value_expr": a.value_expr,
+                    "value_source": a.value_source,
+                }
+                for a in entry.arguments
+            ]
+        # Include result_var if present
+        if entry.result_var:
+            d["result_var"] = entry.result_var
         return d
 
     target_dict = {

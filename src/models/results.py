@@ -108,6 +108,20 @@ class MemberRef:
 
 
 @dataclass
+class ArgumentInfo:
+    """Argument-to-parameter mapping at a call site.
+
+    Maps an actual argument value at a call site to the formal parameter
+    of the callee method/constructor.
+    """
+
+    position: int  # 0-based argument position
+    param_name: Optional[str] = None  # Formal parameter name from callee (e.g., "$productId")
+    value_expr: Optional[str] = None  # Source expression text (e.g., "$input->productId")
+    value_source: Optional[str] = None  # Value kind: "parameter", "local", "literal", "result"
+
+
+@dataclass
 class ContextEntry:
     """Single entry in context tree (used_by or uses)."""
 
@@ -127,6 +141,10 @@ class ContextEntry:
     # When this entry represents a member usage (not direct class usage),
     # member_ref identifies which specific member is being referenced
     member_ref: Optional["MemberRef"] = None
+    # Phase 2: Argument-to-parameter mappings for calls (empty if not a call or no args)
+    arguments: list["ArgumentInfo"] = field(default_factory=list)
+    # Phase 2: Name of local variable that receives this call's result
+    result_var: Optional[str] = None
 
 
 @dataclass

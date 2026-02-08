@@ -116,3 +116,191 @@ class TestInferReferenceType:
         # Even if target is wrong kind, extends edge means extends
         node = make_node("Method")  # Unusual but possible with malformed data
         assert _infer_reference_type(edge, node) == "extends"
+
+
+class _MockIndex:
+    """Minimal mock index for _infer_reference_type tests that need source node lookup.
+
+    Supports the cross-referencing logic in _infer_reference_type that checks
+    type_hint edges from Argument children to distinguish parameter_type vs return_type.
+    """
+
+    def __init__(self, nodes: dict[str, NodeData], contains: dict[str, list[str]] = None,
+                 type_hints: dict[str, list] = None):
+        from collections import defaultdict
+        self.nodes = nodes
+        self._contains = contains or {}
+        # outgoing[node_id]["type_hint"] -> list of EdgeData-like objects
+        self.outgoing = defaultdict(lambda: defaultdict(list))
+        if type_hints:
+            for source_id, edges in type_hints.items():
+                self.outgoing[source_id]["type_hint"] = edges
+
+    def get_contains_children(self, node_id: str) -> list[str]:
+        return self._contains.get(node_id, [])
+
+
+class TestInferReferenceTypeWithIndex:
+    """Tests for _infer_reference_type() with index parameter (Phase 1, Issue 3).
+
+    When the index is provided, _infer_reference_type can look up the source node
+    of a type_hint edge to distinguish parameter_type, return_type, and property_type.
+    """
+
+    def test_t1_6_argument_source_returns_parameter_type(self):
+        """T1.6: uses edge to Class with Argument source returns parameter_type."""
+        edge = make_edge("uses", source="arg:$input", target="class:CreateOrderInput")
+        target = make_node("Class", "CreateOrderInput", "App\\Dto\\CreateOrderInput")
+        source = make_node("Argument", "$input", "App\\Service\\OrderService::createOrder.$input")
+        source.id = "arg:$input"
+
+        index = _MockIndex({"arg:$input": source})
+        assert _infer_reference_type(edge, target, index) == "parameter_type"
+
+    def test_t1_7_method_source_returns_return_type(self):
+        """T1.7: uses edge to Class with Method source returns return_type.
+
+        The method has a direct type_hint edge to the target (return type),
+        and no Argument child has a type_hint to the target.
+        """
+        edge = make_edge("uses", source="method:createOrder", target="class:OrderOutput")
+        target = make_node("Class", "OrderOutput", "App\\Dto\\OrderOutput")
+        source = make_node("Method", "createOrder", "App\\Service\\OrderService::createOrder")
+        source.id = "method:createOrder"
+
+        # Method has a type_hint edge to OrderOutput (return type)
+        return_type_hint = EdgeData(type="type_hint", source="method:createOrder", target="class:OrderOutput")
+        index = _MockIndex(
+            nodes={"method:createOrder": source},
+            contains={"method:createOrder": []},  # no argument children
+            type_hints={"method:createOrder": [return_type_hint]},
+        )
+        assert _infer_reference_type(edge, target, index) == "return_type"
+
+    def test_property_source_returns_property_type(self):
+        """uses edge to Class with Property source returns property_type."""
+        edge = make_edge("uses", source="prop:$logger", target="class:LoggerInterface")
+        target = make_node("Interface", "LoggerInterface", "Psr\\Log\\LoggerInterface")
+        source = make_node("Property", "$logger", "App\\Service\\OrderService::$logger")
+        source.id = "prop:$logger"
+
+        index = _MockIndex({"prop:$logger": source})
+        assert _infer_reference_type(edge, target, index) == "property_type"
+
+    def test_function_source_returns_return_type(self):
+        """uses edge to Class with Function source returns return_type."""
+        edge = make_edge("uses", source="func:getUser", target="class:User")
+        target = make_node("Class", "User", "App\\Entity\\User")
+        source = make_node("Function", "getUser", "getUser")
+        source.id = "func:getUser"
+
+        # Function has a type_hint edge to User (return type)
+        return_type_hint = EdgeData(type="type_hint", source="func:getUser", target="class:User")
+        index = _MockIndex(
+            nodes={"func:getUser": source},
+            contains={"func:getUser": []},
+            type_hints={"func:getUser": [return_type_hint]},
+        )
+        assert _infer_reference_type(edge, target, index) == "return_type"
+
+    def test_method_source_with_param_type_hint_returns_parameter_type(self):
+        """Method source with Argument child having type_hint to target returns parameter_type.
+
+        This tests the cross-referencing logic: the uses edge source is the Method,
+        but the method has an Argument child with a type_hint to the target class,
+        indicating this is a parameter type, not a return type.
+        """
+        edge = make_edge("uses", source="method:createOrder", target="class:CreateOrderInput")
+        target = make_node("Class", "CreateOrderInput", "App\\Dto\\CreateOrderInput")
+        source = make_node("Method", "createOrder", "App\\Service\\OrderService::createOrder")
+        source.id = "method:createOrder"
+        arg = make_node("Argument", "$input", "App\\Service\\OrderService::createOrder.$input")
+        arg.id = "arg:$input"
+
+        # Argument has a type_hint edge to CreateOrderInput (parameter type)
+        param_type_hint = EdgeData(type="type_hint", source="arg:$input", target="class:CreateOrderInput")
+        index = _MockIndex(
+            nodes={"method:createOrder": source, "arg:$input": arg},
+            contains={"method:createOrder": ["arg:$input"]},
+            type_hints={"arg:$input": [param_type_hint]},
+        )
+        assert _infer_reference_type(edge, target, index) == "parameter_type"
+
+    def test_method_source_no_type_hints_returns_type_hint(self):
+        """Method source with no type_hint edges falls back to type_hint."""
+        edge = make_edge("uses", source="method:foo", target="class:Bar")
+        target = make_node("Class", "Bar", "App\\Bar")
+        source = make_node("Method", "foo", "App\\Foo::foo")
+        source.id = "method:foo"
+
+        # No type_hint edges at all
+        index = _MockIndex(
+            nodes={"method:foo": source},
+            contains={"method:foo": []},
+            type_hints={},
+        )
+        assert _infer_reference_type(edge, target, index) == "type_hint"
+
+    def test_t1_8_no_index_backward_compat(self):
+        """T1.8: uses edge to Class without index returns type_hint (backward compat)."""
+        edge = make_edge("uses")
+        target = make_node("Class", "Order", "App\\Entity\\Order")
+        # No index passed -- should fall back to "type_hint"
+        assert _infer_reference_type(edge, target) == "type_hint"
+
+    def test_no_index_explicit_none_backward_compat(self):
+        """uses edge to Class with index=None returns type_hint (backward compat)."""
+        edge = make_edge("uses")
+        target = make_node("Interface", "OrderRepositoryInterface")
+        assert _infer_reference_type(edge, target, index=None) == "type_hint"
+
+    def test_source_not_in_index_returns_type_hint(self):
+        """uses edge to Class where source node not found in index returns type_hint."""
+        edge = make_edge("uses", source="unknown:node", target="class:Foo")
+        target = make_node("Class", "Foo", "App\\Foo")
+        # Index exists but doesn't contain the source node
+        index = _MockIndex({})
+        assert _infer_reference_type(edge, target, index) == "type_hint"
+
+    def test_file_source_returns_type_hint(self):
+        """uses edge to Class with File source returns type_hint (import statement)."""
+        edge = make_edge("uses", source="file:OrderService.php", target="class:Order")
+        target = make_node("Class", "Order", "App\\Entity\\Order")
+        source = make_node("File", "OrderService.php", "src/Service/OrderService.php")
+        source.id = "file:OrderService.php"
+        source.kind = "File"
+
+        index = _MockIndex({"file:OrderService.php": source})
+        # File sources are imports, not param/return/property types
+        assert _infer_reference_type(edge, target, index) == "type_hint"
+
+    def test_class_source_returns_type_hint(self):
+        """uses edge to Class with Class source returns type_hint."""
+        edge = make_edge("uses", source="class:OrderService", target="class:Order")
+        target = make_node("Class", "Order", "App\\Entity\\Order")
+        source = make_node("Class", "OrderService", "App\\Service\\OrderService")
+        source.id = "class:OrderService"
+
+        index = _MockIndex({"class:OrderService": source})
+        assert _infer_reference_type(edge, target, index) == "type_hint"
+
+    def test_index_only_used_for_class_interface_targets(self):
+        """Index is only consulted for Class/Interface/Trait/Enum targets."""
+        # Method target: returns method_call regardless of index
+        edge = make_edge("uses", source="method:foo", target="method:bar")
+        target = make_node("Method", "bar", "App\\Foo::bar")
+        source = make_node("Argument", "$x", "App\\Foo::bar.$x")
+        source.id = "method:foo"
+
+        index = _MockIndex({"method:foo": source})
+        assert _infer_reference_type(edge, target, index) == "method_call"
+
+    def test_extends_edge_ignores_index(self):
+        """extends edge returns extends regardless of index."""
+        edge = make_edge("extends", source="class:Child", target="class:Parent")
+        target = make_node("Class", "Parent", "App\\Parent")
+        source = make_node("Class", "Child", "App\\Child")
+        source.id = "class:Child"
+
+        index = _MockIndex({"class:Child": source})
+        assert _infer_reference_type(edge, target, index) == "extends"

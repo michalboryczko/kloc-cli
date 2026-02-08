@@ -2,7 +2,7 @@
 
 from typing import Optional, TYPE_CHECKING
 
-from ..models import ContextResult, ContextEntry, MemberRef, InheritEntry, OverrideEntry, NodeData
+from ..models import ContextResult, ContextEntry, MemberRef, InheritEntry, OverrideEntry, NodeData, ArgumentInfo
 from ..models.edge import EdgeData
 from .base import Query
 
@@ -208,6 +208,22 @@ def find_call_for_usage(index: "SoTIndex", source_id: str, target_id: str, file:
                         if _call_matches_target(index, call_id, target_id):
                             return call_id
 
+        # Constructor fallback: search call_children for constructor Call nodes
+        # whose callee's containing class matches the target_id. This handles
+        # the case where get_calls_to(target_id) returns nothing because
+        # constructor Calls target __construct(), not the Class itself.
+        # Allow +/- 1 line tolerance because `uses` edge location may refer
+        # to the class name token while the Call node range covers `new X(...)`.
+        for call_id in call_children:
+            call_node = index.nodes.get(call_id)
+            if (call_node and call_node.call_kind == "constructor"
+                    and call_node.file == file):
+                if call_node.range:
+                    call_line = call_node.range.get("start_line", -1)
+                    if abs(call_line - line) <= 1:
+                        if _call_matches_target(index, call_id, target_id):
+                            return call_id
+
     # If no location match, try to find any call from source to target
     for call_id in calls:
         call_node = index.nodes.get(call_id)
@@ -330,11 +346,18 @@ def resolve_access_chain_symbol(index: "SoTIndex", call_node_id: str) -> Optiona
     return None
 
 
-def _infer_reference_type(edge: EdgeData, target_node: Optional[NodeData]) -> str:
+def _infer_reference_type(edge: EdgeData, target_node: Optional[NodeData], index: Optional["SoTIndex"] = None) -> str:
     """Infer reference type from edge type and target node kind.
 
     Without calls.json, we can only infer based on sot.json edge metadata.
     This provides a best-effort classification that may be ambiguous in some cases.
+
+    When an index is provided, type_hint references to Class/Interface/Trait/Enum
+    targets are further distinguished by checking the source node kind:
+    - Argument source -> parameter_type
+    - Method/Function source -> return_type
+    - Property source -> property_type
+    - Other/unknown -> type_hint (fallback)
 
     Reference Type Inference Rules:
     | Edge Type | Target Kind | Inferred Reference Type |
@@ -344,14 +367,15 @@ def _infer_reference_type(edge: EdgeData, target_node: Optional[NodeData]) -> st
     | uses_trait| Trait       | uses_trait             |
     | uses      | Method      | method_call (could be static) |
     | uses      | Property    | property_access or type_hint |
-    | uses      | Class       | type_hint (could be instantiation) |
+    | uses      | Class       | parameter_type / return_type / property_type / type_hint |
 
     Args:
         edge: The edge data from sot.json
         target_node: The target node of the edge (if resolved)
+        index: Optional SoT index for source node lookup (enables param/return type distinction)
 
     Returns:
-        A reference type string (e.g., "method_call", "type_hint", "extends")
+        A reference type string (e.g., "method_call", "parameter_type", "extends")
     """
     # Direct edge type mappings
     if edge.type == "extends":
@@ -371,8 +395,56 @@ def _infer_reference_type(edge: EdgeData, target_node: Optional[NodeData]) -> st
             # Could be property_access or type_hint for property declarations
             return "property_access"
         if kind in ("Class", "Interface", "Trait", "Enum"):
-            # Most common case is type_hint (parameter types, return types, property types)
-            # Could also be instantiation, but we can't distinguish without calls.json
+            # Distinguish parameter_type / return_type / property_type when index available.
+            # For 'uses' edges, the source is typically the containing Method/Class/File.
+            # To determine if a Class reference is a param type vs return type, we check
+            # the type_hint edges: if an Argument of the source method has a type_hint
+            # to this target, it's parameter_type; if the Method itself has a type_hint
+            # to the target, it's return_type; if a Property has a type_hint, it's property_type.
+            if index is not None:
+                source_node = index.nodes.get(edge.source)
+                if source_node:
+                    if source_node.kind == "Argument":
+                        return "parameter_type"
+                    if source_node.kind == "Property":
+                        return "property_type"
+                    if source_node.kind in ("Method", "Function"):
+                        # Check type_hint edges to distinguish param vs return type.
+                        # First check if any Argument child of this method has a
+                        # type_hint edge to the target (parameter_type).
+                        target_id = edge.target
+                        method_id = edge.source
+                        has_param_type_hint = False
+                        has_return_type_hint = False
+                        for child_id in index.get_contains_children(method_id):
+                            child = index.nodes.get(child_id)
+                            if child and child.kind == "Argument":
+                                for th_edge in index.outgoing[child_id].get("type_hint", []):
+                                    if th_edge.target == target_id:
+                                        has_param_type_hint = True
+                                        break
+                            if has_param_type_hint:
+                                break
+                        # Check if the method itself has a type_hint to the target (return_type)
+                        for th_edge in index.outgoing[method_id].get("type_hint", []):
+                            if th_edge.target == target_id:
+                                has_return_type_hint = True
+                                break
+                        if has_param_type_hint:
+                            return "parameter_type"
+                        if has_return_type_hint:
+                            return "return_type"
+                    if source_node.kind in ("Class", "Interface", "Trait", "Enum"):
+                        # Class-level query: check if any Property child has a
+                        # type_hint edge to the target (property_type).
+                        target_id = edge.target
+                        class_id = edge.source
+                        for child_id in index.get_contains_children(class_id):
+                            child = index.nodes.get(child_id)
+                            if child and child.kind == "Property":
+                                for th_edge in index.outgoing[child_id].get("type_hint", []):
+                                    if th_edge.target == target_id:
+                                        return "property_type"
             return "type_hint"
         if kind == "Constant":
             return "constant_access"
@@ -586,7 +658,7 @@ class ContextQuery(Query[ContextResult]):
                                 access_chain_symbol = resolve_access_chain_symbol(self.index, call_node_id)
                             else:
                                 # Fall back to inference from edge/node types
-                                reference_type = _infer_reference_type(edge, target_node)
+                                reference_type = _infer_reference_type(edge, target_node, self.index)
 
                             member_ref = MemberRef(
                                 target_name=self._member_display_name(target_node),
@@ -618,7 +690,7 @@ class ContextQuery(Query[ContextResult]):
                             access_chain_symbol = resolve_access_chain_symbol(self.index, call_node_id)
                         else:
                             # Infer reference type for direct edges (extends, implements, type_hint)
-                            reference_type = _infer_reference_type(edge, target_node)
+                            reference_type = _infer_reference_type(edge, target_node, self.index)
 
                         # For direct edges, create a member_ref to hold the reference_type
                         # and access_chain
@@ -819,6 +891,275 @@ class ContextQuery(Query[ContextResult]):
 
         return False
 
+    def _resolve_param_name(self, call_node_id: str, position: int) -> Optional[str]:
+        """Get the formal parameter name at the given position from the callee.
+
+        Resolves the Call node's target (callee method/function), gets its
+        Argument children in containment order, and returns the name at the
+        requested position.
+
+        Args:
+            call_node_id: ID of the Call node.
+            position: 0-based argument position.
+
+        Returns:
+            Parameter name string (e.g., "$productId") or None if not found.
+        """
+        target_id = self.index.get_call_target(call_node_id)
+        if not target_id:
+            return None
+        children = self.index.get_contains_children(target_id)
+        arg_nodes = []
+        for child_id in children:
+            child = self.index.nodes.get(child_id)
+            if child and child.kind == "Argument":
+                arg_nodes.append(child)
+        if position < len(arg_nodes):
+            return arg_nodes[position].name
+        return None
+
+    def _find_result_var(self, call_node_id: str) -> Optional[str]:
+        """Find the local variable name that receives this call's result.
+
+        Follows: Call --produces--> Value (result) <--assigned_from-- Value (local)
+
+        Args:
+            call_node_id: ID of the Call node.
+
+        Returns:
+            Local variable name (e.g., "$order") or None if no assignment.
+        """
+        result_id = self.index.get_produces(call_node_id)
+        if not result_id:
+            return None
+        # Find locals assigned from this result value.
+        # Edge direction: local_value --assigned_from--> result_value
+        # So incoming[result_id]["assigned_from"] gives edges where target=result_id
+        for edge in self.index.incoming[result_id].get("assigned_from", []):
+            source_node = self.index.nodes.get(edge.source)
+            if source_node and source_node.kind == "Value" and source_node.value_kind == "local":
+                return source_node.name
+        return None
+
+    def _get_argument_info(self, call_node_id: str) -> list:
+        """Get argument-to-parameter mappings for a Call node.
+
+        Returns a list of ArgumentInfo instances (or empty list if ArgumentInfo
+        is not yet available or the call has no arguments).
+
+        Args:
+            call_node_id: ID of the Call node.
+
+        Returns:
+            List of ArgumentInfo instances with position, param_name, value_expr, value_source.
+        """
+
+        arg_edges = self.index.get_arguments(call_node_id)
+        arguments = []
+        for arg_node_id, position in arg_edges:
+            arg_node = self.index.nodes.get(arg_node_id)
+            if arg_node:
+                param_name = self._resolve_param_name(call_node_id, position)
+                arguments.append(ArgumentInfo(
+                    position=position,
+                    param_name=param_name,
+                    value_expr=arg_node.name,
+                    value_source=arg_node.value_kind,
+                ))
+        return arguments
+
+    def _get_type_references(
+        self, method_id: str, depth: int, cycle_guard: set, count: list, limit: int
+    ) -> list[ContextEntry]:
+        """Extract type-related references (param types, return types) from uses edges.
+
+        When using execution flow for methods, Call nodes don't capture type hints
+        for parameters and return types. This helper extracts those from the
+        structural `uses` edges so they still appear in USES output.
+
+        Only includes entries where the inferred reference type is a type-related
+        value (parameter_type, return_type, property_type, type_hint).
+        """
+        TYPE_KINDS = {"parameter_type", "return_type", "property_type", "type_hint"}
+        entries = []
+        local_visited: set[str] = set()
+
+        edges = self.index.get_deps(method_id)
+        for edge in edges:
+            target_id = edge.target
+            if target_id in cycle_guard or target_id in local_visited:
+                continue
+
+            target_node = self.index.nodes.get(target_id)
+            if not target_node:
+                continue
+
+            # Only include Class/Interface/Trait/Enum targets (type references)
+            if target_node.kind not in ("Class", "Interface", "Trait", "Enum"):
+                continue
+
+            # Infer reference type — only keep type-related ones
+            ref_type = _infer_reference_type(edge, target_node, self.index)
+            if ref_type not in TYPE_KINDS:
+                continue
+
+            # Check if there's a Call node (constructor) for this target
+            file = edge.location.get("file") if edge.location else target_node.file
+            line = edge.location.get("line") if edge.location else target_node.start_line
+            call_node_id = find_call_for_usage(self.index, method_id, target_id, file, line)
+            if call_node_id:
+                # This is a constructor call — it will be picked up by execution flow
+                continue
+
+            local_visited.add(target_id)
+            if count[0] >= limit:
+                break
+            count[0] += 1
+
+            member_ref = MemberRef(
+                target_name="",
+                target_fqn=target_node.fqn,
+                target_kind=target_node.kind,
+                file=file,
+                line=line,
+                reference_type=ref_type,
+                access_chain=None,
+                access_chain_symbol=None,
+            )
+
+            entry_kwargs = dict(
+                depth=depth,
+                node_id=target_id,
+                fqn=target_node.fqn,
+                kind=target_node.kind,
+                file=file,
+                line=line,
+                signature=target_node.signature,
+                children=[],
+                implementations=[],
+                member_ref=member_ref,
+                arguments=[],
+                result_var=None,
+            )
+            entries.append(ContextEntry(**entry_kwargs))
+
+        entries.sort(key=lambda e: (e.file or "", e.line if e.line is not None else 0))
+        return entries
+
+    def _build_execution_flow(
+        self, method_id: str, depth: int, max_depth: int,
+        limit: int, cycle_guard: set, count: list,
+        include_impl: bool = False, shown_impl_for: set | None = None,
+    ) -> list[ContextEntry]:
+        """Build execution flow for a method by iterating its Call children.
+
+        Instead of following `uses` edges (structural), this iterates the
+        method's Call node children in line-number order (behavioral). This
+        gives an execution-flow view that shows what the method actually does:
+        which methods it calls, in what order, with what arguments, and what
+        variables receive the results.
+
+        Args:
+            method_id: The Method/Function node ID to build flow for.
+            depth: Current depth level in the tree.
+            max_depth: Maximum depth to expand.
+            limit: Maximum number of entries.
+            cycle_guard: Set of node IDs to prevent infinite recursion.
+            count: Mutable list[int] tracking total entries created.
+            include_impl: Whether to attach implementations for interface methods.
+            shown_impl_for: Set tracking nodes with implementations already shown.
+        """
+        if depth > max_depth or count[0] >= limit:
+            return []
+
+        if shown_impl_for is None:
+            shown_impl_for = set()
+
+        children = self.index.get_contains_children(method_id)
+        entries = []
+
+        # Per-parent dedup: prevent showing the same callee twice within this method
+        local_visited: set[str] = set()
+
+        for child_id in children:
+            child = self.index.nodes.get(child_id)
+            if not child or child.kind != "Call":
+                continue
+            if count[0] >= limit:
+                break
+
+            target_id = self.index.get_call_target(child_id)
+            if not target_id:
+                continue
+            if target_id in local_visited:
+                continue
+            local_visited.add(target_id)
+
+            target_node = self.index.nodes.get(target_id)
+            if not target_node:
+                continue
+
+            # Skip self-references (method calling itself is handled by cycle_guard)
+            if target_id in cycle_guard:
+                continue
+
+            count[0] += 1
+            reference_type = get_reference_type_from_call(self.index, child_id)
+            access_chain = build_access_chain(self.index, child_id)
+            access_chain_symbol = resolve_access_chain_symbol(self.index, child_id)
+            arguments = self._get_argument_info(child_id)
+            result_var = self._find_result_var(child_id)
+
+            call_line = child.range.get("start_line") if child.range else None
+
+            member_ref = MemberRef(
+                target_name="",
+                target_fqn=target_node.fqn,
+                target_kind=target_node.kind,
+                file=child.file,
+                line=call_line,
+                reference_type=reference_type,
+                access_chain=access_chain,
+                access_chain_symbol=access_chain_symbol,
+            )
+
+            entry_kwargs = dict(
+                depth=depth,
+                node_id=target_id,
+                fqn=target_node.fqn,
+                kind=target_node.kind,
+                file=child.file,
+                line=call_line,
+                signature=target_node.signature,
+                children=[],
+                implementations=[],
+                member_ref=member_ref,
+                arguments=arguments,
+                result_var=result_var,
+            )
+            entry = ContextEntry(**entry_kwargs)
+
+            # Attach implementations for interface methods
+            if include_impl and target_node and target_id not in shown_impl_for:
+                shown_impl_for.add(target_id)
+                entry.implementations = self._get_implementations_for_node(
+                    target_node, depth, max_depth, limit, cycle_guard, count, shown_impl_for
+                )
+
+            # Depth expansion: recurse into callee's execution flow
+            if depth < max_depth and target_node.kind in ("Method", "Function"):
+                entry.children = self._build_execution_flow(
+                    target_id, depth + 1, max_depth, limit,
+                    cycle_guard | {target_id}, count,
+                    include_impl=include_impl, shown_impl_for=shown_impl_for,
+                )
+
+            entries.append(entry)
+
+        # Sort by line number for execution order
+        entries.sort(key=lambda e: (e.file or "", e.line if e.line is not None else 0))
+        return entries
+
     def _build_outgoing_tree(
         self, start_id: str, max_depth: int, limit: int, include_impl: bool = False
     ) -> list[ContextEntry]:
@@ -842,6 +1183,25 @@ class ContextQuery(Query[ContextResult]):
         count = [0]  # Use list to allow mutation in nested function
         # Track nodes we've already shown implementations for to prevent infinite loops
         shown_impl_for: set[str] = set()
+
+        # Phase 3: For Method/Function nodes, use execution flow traversal
+        # which iterates Call children in line-number order instead of
+        # following structural `uses` edges. Also include structural type
+        # references (parameter_type, return_type, property_type, type_hint)
+        # since these provide important context about method signatures.
+        start_node = self.index.nodes.get(start_id)
+        if start_node and start_node.kind in ("Method", "Function"):
+            # Get structural type references from uses edges
+            type_entries = self._get_type_references(
+                start_id, 1, cycle_guard, count, limit
+            )
+            # Get execution flow from Call children
+            call_entries = self._build_execution_flow(
+                start_id, 1, max_depth, limit, cycle_guard, count,
+                include_impl=include_impl, shown_impl_for=shown_impl_for,
+            )
+            # Combine: type references first, then call entries in execution order
+            return type_entries + call_entries
 
         def build_tree(current_id: str, current_depth: int) -> list[ContextEntry]:
             if current_depth > max_depth or count[0] >= limit:
@@ -879,6 +1239,8 @@ class ContextQuery(Query[ContextResult]):
 
                 # Try to find a Call node for reference type and access chain
                 member_ref = None
+                arguments = []
+                result_var = None
                 if target_node:
                     call_node_id = find_call_for_usage(
                         self.index, current_id, target_id, file, line
@@ -887,15 +1249,20 @@ class ContextQuery(Query[ContextResult]):
                     reference_type = None
                     access_chain = None
                     access_chain_symbol = None
+                    arguments = []
+                    result_var = None
 
                     if call_node_id:
                         reference_type = get_reference_type_from_call(self.index, call_node_id)
                         access_chain = build_access_chain(self.index, call_node_id)
                         # R4: Resolve access chain property FQN
                         access_chain_symbol = resolve_access_chain_symbol(self.index, call_node_id)
+                        # Phase 2: Argument tracking
+                        arguments = self._get_argument_info(call_node_id)
+                        result_var = self._find_result_var(call_node_id)
                     else:
                         # Fall back to inference from edge/node types
-                        reference_type = _infer_reference_type(edge, target_node)
+                        reference_type = _infer_reference_type(edge, target_node, self.index)
 
                     # For USES, target_name is empty since fqn already shows the target
                     # We only need reference_type and access_chain
@@ -910,7 +1277,7 @@ class ContextQuery(Query[ContextResult]):
                         access_chain_symbol=access_chain_symbol,
                     )
 
-                entry = ContextEntry(
+                entry_kwargs = dict(
                     depth=current_depth,
                     node_id=target_id,
                     fqn=target_node.fqn if target_node else target_id,
@@ -921,7 +1288,10 @@ class ContextQuery(Query[ContextResult]):
                     children=[],
                     implementations=[],
                     member_ref=member_ref,
+                    arguments=arguments,
+                    result_var=result_var,
                 )
+                entry = ContextEntry(**entry_kwargs)
 
                 # Attach implementations for interfaces/methods with their deps expanded
                 # Skip if we've already shown implementations for this node
@@ -1079,6 +1449,8 @@ class ContextQuery(Query[ContextResult]):
 
             # Try to find a Call node for reference type and access chain
             member_ref = None
+            arguments = []
+            result_var = None
             if target_node:
                 call_node_id = find_call_for_usage(
                     self.index, start_id, target_id, file, line
@@ -1093,9 +1465,12 @@ class ContextQuery(Query[ContextResult]):
                     access_chain = build_access_chain(self.index, call_node_id)
                     # R4: Resolve access chain property FQN
                     access_chain_symbol = resolve_access_chain_symbol(self.index, call_node_id)
+                    # Phase 2: Argument tracking
+                    arguments = self._get_argument_info(call_node_id)
+                    result_var = self._find_result_var(call_node_id)
                 else:
                     # Fall back to inference from edge/node types
-                    reference_type = _infer_reference_type(edge, target_node)
+                    reference_type = _infer_reference_type(edge, target_node, self.index)
 
                 # For USES, target_name is empty since fqn already shows the target
                 member_ref = MemberRef(
@@ -1109,7 +1484,7 @@ class ContextQuery(Query[ContextResult]):
                     access_chain_symbol=access_chain_symbol,
                 )
 
-            entry = ContextEntry(
+            entry_kwargs = dict(
                 depth=depth,
                 node_id=target_id,
                 fqn=target_node.fqn if target_node else target_id,
@@ -1120,7 +1495,10 @@ class ContextQuery(Query[ContextResult]):
                 children=[],
                 implementations=[],
                 member_ref=member_ref,
+                arguments=arguments,
+                result_var=result_var,
             )
+            entry = ContextEntry(**entry_kwargs)
 
             # Attach implementations for interfaces/methods
             # Skip if we've already shown implementations for this node

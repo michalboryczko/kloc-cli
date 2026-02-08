@@ -296,6 +296,30 @@ class MCPServer:
                 d["signature"] = e.signature
             if e.implementations:
                 d["implementations"] = [entry_to_dict(i) for i in e.implementations]
+            if e.via_interface:
+                d["via_interface"] = True
+            if e.member_ref:
+                mr = {
+                    "target_name": e.member_ref.target_name,
+                    "target_fqn": e.member_ref.target_fqn,
+                    "target_kind": e.member_ref.target_kind,
+                    "file": e.member_ref.file,
+                    "line": e.member_ref.line + 1 if e.member_ref.line is not None else None,
+                }
+                if e.member_ref.reference_type:
+                    mr["reference_type"] = e.member_ref.reference_type
+                if e.member_ref.access_chain:
+                    mr["access_chain"] = e.member_ref.access_chain
+                if e.member_ref.access_chain_symbol:
+                    mr["access_chain_symbol"] = e.member_ref.access_chain_symbol
+                d["member_ref"] = mr
+            if e.arguments:
+                d["arguments"] = [
+                    {"position": a.position, "param_name": a.param_name, "value_expr": a.value_expr, "value_source": a.value_source}
+                    for a in e.arguments
+                ]
+            if e.result_var:
+                d["result_var"] = e.result_var
             return d
 
         return {"target": {"fqn": result.target.fqn, "file": result.target.file}, "used_by": [entry_to_dict(e) for e in result.used_by], "uses": [entry_to_dict(e) for e in result.uses]}
