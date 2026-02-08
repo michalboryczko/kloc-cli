@@ -188,7 +188,11 @@ def print_context_tree(result: ContextResult, console: Console):
                 label += f" [dim]({entry.file})[/dim]"
             # Add access chain on a new line if present
             if entry.member_ref and entry.member_ref.access_chain:
-                label += f"\n        [dim]on:[/dim] [green]{entry.member_ref.access_chain}[/green]"
+                chain_text = entry.member_ref.access_chain
+                # R4: Include property FQN in parentheses after access chain if available
+                if entry.member_ref.access_chain_symbol:
+                    chain_text += f" ({entry.member_ref.access_chain_symbol})"
+                label += f"\n        [dim]on:[/dim] [green]{chain_text}[/green]"
 
             branch = parent.add(label)
 
@@ -272,9 +276,12 @@ def context_tree_to_dict(result: ContextResult) -> dict:
             # Include reference_type if present
             if entry.member_ref.reference_type:
                 member_ref_dict["reference_type"] = entry.member_ref.reference_type
-            # Include access_chain if present (from calls.json)
+            # Include access_chain if present
             if entry.member_ref.access_chain:
                 member_ref_dict["access_chain"] = entry.member_ref.access_chain
+            # R4: Include access_chain_symbol if present (property FQN)
+            if entry.member_ref.access_chain_symbol:
+                member_ref_dict["access_chain_symbol"] = entry.member_ref.access_chain_symbol
             d["member_ref"] = member_ref_dict
         return d
 

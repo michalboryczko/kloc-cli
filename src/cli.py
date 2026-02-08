@@ -224,6 +224,7 @@ def context(
     limit: int = typer.Option(100, "--limit", "-l", help="Maximum results per direction"),
     impl: bool = typer.Option(False, "--impl", "-i", help="Include implementations/overrides"),
     direct: bool = typer.Option(False, "--direct", help="Show only direct symbol references (no member usages)"),
+    with_imports: bool = typer.Option(False, "--with-imports", help="Include PHP import/use statements in USED BY output"),
     json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
 ):
     """Get combined usages and dependencies with depth expansion.
@@ -237,6 +238,13 @@ def context(
     With --direct flag:
     - USED BY direction: shows only direct references to the symbol itself (extends,
       implements, type hints), excluding usages that only reference its members
+
+    With --with-imports flag:
+    - USED BY direction: includes PHP import/use statements (hidden by default)
+
+    Depth chaining rules (USED BY):
+    - Only method_call, property_access, instantiation, and static_call edges
+      are followed for depth N+1. Type hints, extends, and implements are leaf nodes.
 
     Example: When querying a concrete method that implements an interface method,
     --impl will also show callers that use the interface method, not just direct callers.
@@ -260,7 +268,8 @@ def context(
     node = resolve_result.candidates[0]
     context_query = ContextQuery(index)
     result = context_query.execute(
-        node.id, depth=depth, limit=limit, include_impl=impl, direct_only=direct
+        node.id, depth=depth, limit=limit, include_impl=impl,
+        direct_only=direct, with_imports=with_imports
     )
 
     if json_output:

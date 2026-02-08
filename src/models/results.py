@@ -99,10 +99,12 @@ class MemberRef:
     target_kind: Optional[str] = None  # "Method", "Property", etc.
     file: Optional[str] = None  # Where the reference occurs
     line: Optional[int] = None  # Line of the reference (0-indexed)
-    # NEW: Reference type classification
+    # Reference type classification
     reference_type: Optional[str] = None  # "method_call", "type_hint", "instantiation", etc.
-    # NEW: Access chain showing receiver expression (requires calls.json)
+    # Access chain showing receiver expression
     access_chain: Optional[str] = None  # "$this->orderRepository" or None
+    # R4: FQN of the intermediate property in the access chain
+    access_chain_symbol: Optional[str] = None  # "App\\Foo::$orderRepository" or None
 
 
 @dataclass

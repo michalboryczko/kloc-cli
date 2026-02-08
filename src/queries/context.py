@@ -11,6 +11,17 @@ if TYPE_CHECKING:
 
 
 # =============================================================================
+# Depth Chaining Rules (R8)
+# =============================================================================
+# Only these reference types represent actual call/data flow relationships
+# and should be followed when expanding USED BY depth N -> N+1.
+# Structural/declarative references (type_hint, extends, implements, use_trait)
+# are leaf nodes -- they do not imply that callers of the source are callers
+# of the target.
+CHAINABLE_REFERENCE_TYPES = {"method_call", "property_access", "instantiation", "static_call"}
+
+
+# =============================================================================
 # Graph-based Access Chain Building
 # =============================================================================
 
@@ -131,6 +142,38 @@ def get_reference_type_from_call(index: "SoTIndex", call_node_id: str) -> str:
     return kind_map.get(call_node.call_kind or "", "unknown")
 
 
+def _call_matches_target(index: "SoTIndex", call_id: str, target_id: str) -> bool:
+    """Check if a Call node's callee matches the expected usage target.
+
+    Handles the special case of constructor calls: when `new Foo()` produces
+    a Call node whose callee is `Foo::__construct()`, and the uses edge target
+    is the `Foo` class itself, the match is accepted because the constructor
+    call represents an instantiation of that class.
+
+    Args:
+        index: The SoT index.
+        call_id: ID of the Call node to check.
+        target_id: Expected target node ID from the uses edge.
+
+    Returns:
+        True if the Call node's callee matches the target.
+    """
+    call_target = index.get_call_target(call_id)
+    if call_target == target_id:
+        return True
+
+    # Constructor special case: Call targets __construct() but uses edge
+    # targets the Class node itself. Accept if the constructor's containing
+    # class matches the target.
+    call_node = index.nodes.get(call_id)
+    if call_node and call_node.call_kind == "constructor" and call_target:
+        constructor_class = index.get_contains_parent(call_target)
+        if constructor_class == target_id:
+            return True
+
+    return False
+
+
 def find_call_for_usage(index: "SoTIndex", source_id: str, target_id: str, file: Optional[str], line: Optional[int]) -> Optional[str]:
     """Find a Call node that matches a usage edge's location.
 
@@ -159,7 +202,11 @@ def find_call_for_usage(index: "SoTIndex", source_id: str, target_id: str, file:
                 if call_node.range:
                     call_line = call_node.range.get("start_line", -1)
                     if call_line == line:
-                        return call_id
+                        # Verify the Call node's callee matches the usage target
+                        # to prevent returning a wrong Call (e.g., constructor
+                        # matched for a static property access on the same line)
+                        if _call_matches_target(index, call_id, target_id):
+                            return call_id
 
     # If no location match, try to find any call from source to target
     for call_id in calls:
@@ -168,7 +215,9 @@ def find_call_for_usage(index: "SoTIndex", source_id: str, target_id: str, file:
             # Check if this call is contained in the source
             container_id = index.get_contains_parent(call_id)
             if container_id == source_id:
-                return call_id
+                # Verify the Call node's callee matches the usage target
+                if _call_matches_target(index, call_id, target_id):
+                    return call_id
 
     return None
 
@@ -203,6 +252,80 @@ def get_containing_scope(index: "SoTIndex", call_node_id: str) -> Optional[str]:
 
         # Continue up the hierarchy
         current_id = parent_id
+
+    return None
+
+
+def _is_import_reference(entry, index: "SoTIndex") -> bool:
+    """Identify whether a context entry represents a PHP import/use statement (R1).
+
+    An import reference is identified by:
+    - The source node is a File node (kind == "File")
+    - The reference type is "type_hint"
+    - This indicates a file-level `use App\\Foo\\Bar;` declaration
+
+    Non-import type hints (constructor parameters, method return types) come from
+    Method/Function sources, not File sources, so they are NOT filtered.
+
+    Args:
+        entry: A ContextEntry to check.
+        index: The SoT index for node lookups.
+
+    Returns:
+        True if the entry represents an import/use statement.
+    """
+    if not entry.member_ref:
+        return False
+
+    if entry.member_ref.reference_type != "type_hint":
+        return False
+
+    # Check if the source node is a File node
+    source_node = index.nodes.get(entry.node_id)
+    if source_node and source_node.kind == "File":
+        return True
+
+    return False
+
+
+def resolve_access_chain_symbol(index: "SoTIndex", call_node_id: str) -> Optional[str]:
+    """Resolve the property FQN from a Call node's receiver chain (R4).
+
+    For a call like `$this->orderService->createOrder()`, the receiver is a
+    property access to `$orderService`. This function finds the FQN of that
+    intermediate property (e.g., `App\\Controller\\OrderController::$orderService`).
+
+    Args:
+        index: The SoT index.
+        call_node_id: ID of the Call node.
+
+    Returns:
+        Property FQN string if resolved, None otherwise.
+    """
+    call_node = index.nodes.get(call_node_id)
+    if not call_node or call_node.kind != "Call":
+        return None
+
+    receiver_id = index.get_receiver(call_node_id)
+    if not receiver_id:
+        return None
+
+    receiver_node = index.nodes.get(receiver_id)
+    if not receiver_node or receiver_node.kind != "Value":
+        return None
+
+    # If the receiver is the result of a property access call, follow to the property
+    if receiver_node.value_kind == "result":
+        source_call_id = index.get_source_call(receiver_id)
+        if source_call_id:
+            source_call = index.nodes.get(source_call_id)
+            if source_call and source_call.kind == "Call" and source_call.call_kind == "access":
+                # This is a property access -- get the target property
+                target_id = index.get_call_target(source_call_id)
+                if target_id:
+                    target_node = index.nodes.get(target_id)
+                    if target_node and target_node.kind == "Property":
+                        return target_node.fqn
 
     return None
 
@@ -280,7 +403,7 @@ class ContextQuery(Query[ContextResult]):
 
     def execute(
         self, node_id: str, depth: int = 1, limit: int = 100, include_impl: bool = False,
-        direct_only: bool = False
+        direct_only: bool = False, with_imports: bool = False
     ) -> ContextResult:
         """Execute context query with BFS tree building.
 
@@ -293,6 +416,8 @@ class ContextQuery(Query[ContextResult]):
                          - USED BY: includes usages of interface methods that concrete methods implement
             direct_only: If True, USED BY shows only direct references to the symbol itself,
                         excluding usages that only reference its members.
+            with_imports: If True, include PHP import/use statements in USED BY output.
+                         By default (False), import statements are hidden.
 
         Returns:
             ContextResult with tree structures for used_by and uses.
@@ -301,7 +426,9 @@ class ContextQuery(Query[ContextResult]):
         if not target_node:
             raise ValueError(f"Node not found: {node_id}")
 
-        used_by = self._build_incoming_tree(node_id, depth, limit, include_impl, direct_only)
+        used_by = self._build_incoming_tree(
+            node_id, depth, limit, include_impl, direct_only, with_imports
+        )
         uses = self._build_outgoing_tree(node_id, depth, limit, include_impl)
 
         return ContextResult(
@@ -323,7 +450,7 @@ class ContextQuery(Query[ContextResult]):
 
     def _build_incoming_tree(
         self, start_id: str, max_depth: int, limit: int, include_impl: bool = False,
-        direct_only: bool = False
+        direct_only: bool = False, with_imports: bool = False
     ) -> list[ContextEntry]:
         """Build nested tree for incoming usages (used_by).
 
@@ -340,13 +467,49 @@ class ContextQuery(Query[ContextResult]):
 
         Reference types and access chains are resolved from the unified graph's
         Call/Value nodes when available.
+
+        Depth chaining rules (R8):
+        - Only chainable reference types (method_call, property_access, instantiation,
+          static_call) expand to depth N+1. Non-chainable types (type_hint, extends,
+          implements, use_trait) are always leaf nodes.
+
+        Recursive USED BY depth (R7):
+        - For each chainable entry at depth N, we resolve the containing method of
+          the source reference, then find callers of that method at depth N+1.
+          This correctly chains through the call graph: if Controller calls Service
+          which calls Repository, querying Repository shows Service at depth 1 and
+          Controller at depth 2.
+
+        External-only filtering (R3):
+        - For class-level queries, internal self-references (own methods accessing
+          own properties) are filtered out.
+
+        Import filtering (R1):
+        - By default, PHP import/use statements are hidden. The with_imports
+          parameter controls this.
+
+        FQN resolution (R6):
+        - File node sources are resolved to their containing class FQN.
+
+        Sort order (R2):
+        - Entries at each depth level are sorted by (file path, line number).
         """
+        # Determine if the start node is a class-level query (for R3 filtering)
+        start_node = self.index.nodes.get(start_id)
+        is_class_query = start_node and start_node.kind in ("Class", "Interface", "Trait", "Enum")
+
+        # Global visited set prevents the same source from appearing at multiple depths
         visited = {start_id}
         count = [0]  # Tracks unique sources for limit
 
-        def build_tree(current_id: str, current_depth: int) -> list[ContextEntry]:
+        def build_tree(current_id: str, current_depth: int,
+                       branch_visited: set[str] | None = None) -> list[ContextEntry]:
             if current_depth > max_depth or count[0] >= limit:
                 return []
+
+            # Per-branch visited set for cycle prevention in recursive depth (R7)
+            if branch_visited is None:
+                branch_visited = set()
 
             # --- Pass 1: collect all entries, claim sources in visited ---
             # This prevents deeper expansions from "stealing" sources that
@@ -365,6 +528,11 @@ class ContextQuery(Query[ContextResult]):
                 # In direct_only mode, skip sources that only have member edges
                 if direct_only and not direct_edges:
                     continue
+
+                # R3: For class queries, filter out internal self-references
+                if is_class_query and current_depth == 1:
+                    if self._is_internal_reference(source_id, start_id):
+                        continue
 
                 if count[0] >= limit:
                     break
@@ -400,6 +568,7 @@ class ContextQuery(Query[ContextResult]):
                     member_ref = None
                     access_chain = None
                     reference_type = None
+                    access_chain_symbol = None
 
                     if is_member:
                         target_node = self.index.nodes.get(edge.target)
@@ -413,6 +582,8 @@ class ContextQuery(Query[ContextResult]):
                             if call_node_id:
                                 reference_type = get_reference_type_from_call(self.index, call_node_id)
                                 access_chain = build_access_chain(self.index, call_node_id)
+                                # R4: Resolve access chain property FQN
+                                access_chain_symbol = resolve_access_chain_symbol(self.index, call_node_id)
                             else:
                                 # Fall back to inference from edge/node types
                                 reference_type = _infer_reference_type(edge, target_node)
@@ -425,6 +596,7 @@ class ContextQuery(Query[ContextResult]):
                                 line=line,
                                 reference_type=reference_type,
                                 access_chain=access_chain,
+                                access_chain_symbol=access_chain_symbol,
                             )
                     else:
                         # Direct reference to the target node itself
@@ -442,6 +614,8 @@ class ContextQuery(Query[ContextResult]):
                         if call_node_id:
                             reference_type = get_reference_type_from_call(self.index, call_node_id)
                             access_chain = build_access_chain(self.index, call_node_id)
+                            # R4: Resolve access chain property FQN
+                            access_chain_symbol = resolve_access_chain_symbol(self.index, call_node_id)
                         else:
                             # Infer reference type for direct edges (extends, implements, type_hint)
                             reference_type = _infer_reference_type(edge, target_node)
@@ -456,13 +630,25 @@ class ContextQuery(Query[ContextResult]):
                             line=line,
                             reference_type=reference_type,
                             access_chain=access_chain,
+                            access_chain_symbol=access_chain_symbol,
                         )
+
+                    # R6: Resolve File node identifiers to their containing class FQN
+                    entry_fqn = source_node.fqn if source_node else source_id
+                    entry_kind = source_node.kind if source_node else None
+                    if source_node and source_node.kind == "File":
+                        resolved_class = self.index.resolve_file_to_class(source_id)
+                        if resolved_class:
+                            resolved_node = self.index.nodes.get(resolved_class)
+                            if resolved_node:
+                                entry_fqn = resolved_node.fqn
+                                entry_kind = resolved_node.kind
 
                     entry = ContextEntry(
                         depth=current_depth,
                         node_id=source_id,
-                        fqn=source_node.fqn if source_node else source_id,
-                        kind=source_node.kind if source_node else None,
+                        fqn=entry_fqn,
+                        kind=entry_kind,
                         file=file,
                         line=line,
                         signature=source_node.signature if source_node else None,
@@ -471,15 +657,40 @@ class ContextQuery(Query[ContextResult]):
                     )
                     entries.append(entry)
 
-            # --- Pass 2: expand children for first entry per source ---
-            # Done after all current-depth entries are claimed, so child
-            # expansion can't steal siblings.
+            # R1: Filter out import references unless with_imports is True
+            if not with_imports:
+                entries = [e for e in entries if not _is_import_reference(e, self.index)]
+
+            # R2: Sort entries by (file path, line number) for consistent ordering
+            entries.sort(key=lambda e: (e.file or "", e.line if e.line is not None else 0))
+
+            # --- Pass 2: expand children using R7 recursive depth and R8 chaining rules ---
+            # For each chainable entry at depth N, resolve the containing method
+            # of the source reference, then find callers of that method at depth N+1.
             if current_depth < max_depth:
                 expanded = set()
                 for entry in entries:
                     if entry.node_id not in expanded:
                         expanded.add(entry.node_id)
-                        entry.children = build_tree(entry.node_id, current_depth + 1)
+
+                        # R8: Only expand children for chainable reference types
+                        ref_type = entry.member_ref.reference_type if entry.member_ref else None
+                        if ref_type not in CHAINABLE_REFERENCE_TYPES:
+                            # Non-chainable types (type_hint, extends, implements, etc.)
+                            # are leaf nodes -- no further depth expansion
+                            continue
+
+                        # R7: Resolve the containing method for recursive USED BY
+                        # The source node (entry.node_id) references our target.
+                        # To find depth N+1, we need to find callers of the METHOD
+                        # that contains the source reference, not callers of the source node itself.
+                        containing_method_id = self._resolve_containing_method(entry.node_id)
+                        if containing_method_id and containing_method_id not in branch_visited:
+                            # Create a new branch_visited set for this branch to prevent cycles
+                            child_branch_visited = branch_visited | {containing_method_id}
+                            entry.children = build_tree(
+                                containing_method_id, current_depth + 1, child_branch_visited
+                            )
 
             return entries
 
@@ -520,6 +731,94 @@ class ContextQuery(Query[ContextResult]):
 
         return direct_entries + interface_entries
 
+    def _resolve_containing_method(self, node_id: str) -> Optional[str]:
+        """Resolve the containing Method/Function for a given node.
+
+        For USED BY depth chaining (R7), we need to find the method that contains
+        a reference so we can find callers of that method at the next depth level.
+
+        If the node IS a Method/Function, return it directly.
+        If the node is a File, return None (file-level references don't chain).
+        Otherwise, traverse containment upward to find the Method/Function.
+
+        Args:
+            node_id: Node ID to resolve.
+
+        Returns:
+            Node ID of the containing Method/Function, or None if not found.
+        """
+        node = self.index.nodes.get(node_id)
+        if not node:
+            return None
+
+        # If the node itself is a Method/Function, use it directly
+        if node.kind in ("Method", "Function"):
+            return node_id
+
+        # If the node is a File, don't chain further (file-level references are leaf nodes)
+        if node.kind == "File":
+            return None
+
+        # Traverse containment hierarchy upward to find the Method/Function
+        current_id = node_id
+        max_depth = 10  # Prevent infinite loops
+        for _ in range(max_depth):
+            parent_id = self.index.get_contains_parent(current_id)
+            if not parent_id:
+                return None
+
+            parent_node = self.index.nodes.get(parent_id)
+            if not parent_node:
+                return None
+
+            if parent_node.kind in ("Method", "Function"):
+                return parent_id
+
+            # File level reached without finding a method
+            if parent_node.kind == "File":
+                return None
+
+            current_id = parent_id
+
+        return None
+
+    def _is_internal_reference(self, source_id: str, target_class_id: str) -> bool:
+        """Check if a source node is internal to the target class (R3).
+
+        A reference is internal if the source node is contained within the
+        target class (e.g., the class's own methods accessing its own properties).
+
+        Args:
+            source_id: The source node of the reference.
+            target_class_id: The class being queried.
+
+        Returns:
+            True if the source is internal to the target class.
+        """
+        current_id = source_id
+        max_depth = 10  # Prevent infinite loops
+
+        for _ in range(max_depth):
+            parent_id = self.index.get_contains_parent(current_id)
+            if not parent_id:
+                return False
+
+            # If we found the target class in the containment chain, it's internal
+            if parent_id == target_class_id:
+                return True
+
+            parent_node = self.index.nodes.get(parent_id)
+            if not parent_node:
+                return False
+
+            # Stop at File level -- we've traversed past any class
+            if parent_node.kind == "File":
+                return False
+
+            current_id = parent_id
+
+        return False
+
     def _build_outgoing_tree(
         self, start_id: str, max_depth: int, limit: int, include_impl: bool = False
     ) -> list[ContextEntry]:
@@ -530,8 +829,16 @@ class ContextQuery(Query[ContextResult]):
 
         Reference types and access chains are resolved from the unified graph's
         Call/Value nodes when available.
+
+        Uses per-parent deduplication: each parent's children are deduplicated
+        independently, allowing the same target to appear under different parents
+        at different depths. The start_id is always excluded to prevent infinite
+        recursion (cycle prevention).
         """
-        visited = {start_id}
+        # Only the start node is globally excluded to prevent cycles.
+        # Per-parent deduplication replaces the old global visited set so that
+        # the same target can appear under different parents at different depths.
+        cycle_guard = {start_id}
         count = [0]  # Use list to allow mutation in nested function
         # Track nodes we've already shown implementations for to prevent infinite loops
         shown_impl_for: set[str] = set()
@@ -543,11 +850,16 @@ class ContextQuery(Query[ContextResult]):
             entries = []
             edges = self.index.get_deps(current_id)
 
+            # Per-parent visited set: prevents duplicate targets within
+            # this parent's children, but allows the same target to appear
+            # under a different parent at a different depth.
+            local_visited: set[str] = set()
+
             for edge in edges:
                 target_id = edge.target
-                if target_id in visited:
+                if target_id in cycle_guard or target_id in local_visited:
                     continue
-                visited.add(target_id)
+                local_visited.add(target_id)
 
                 if count[0] >= limit:
                     break
@@ -574,10 +886,13 @@ class ContextQuery(Query[ContextResult]):
 
                     reference_type = None
                     access_chain = None
+                    access_chain_symbol = None
 
                     if call_node_id:
                         reference_type = get_reference_type_from_call(self.index, call_node_id)
                         access_chain = build_access_chain(self.index, call_node_id)
+                        # R4: Resolve access chain property FQN
+                        access_chain_symbol = resolve_access_chain_symbol(self.index, call_node_id)
                     else:
                         # Fall back to inference from edge/node types
                         reference_type = _infer_reference_type(edge, target_node)
@@ -592,6 +907,7 @@ class ContextQuery(Query[ContextResult]):
                         line=line,
                         reference_type=reference_type,
                         access_chain=access_chain,
+                        access_chain_symbol=access_chain_symbol,
                     )
 
                 entry = ContextEntry(
@@ -612,7 +928,7 @@ class ContextQuery(Query[ContextResult]):
                 if include_impl and target_node and target_id not in shown_impl_for:
                     shown_impl_for.add(target_id)
                     entry.implementations = self._get_implementations_for_node(
-                        target_node, current_depth, max_depth, limit, visited, count, shown_impl_for
+                        target_node, current_depth, max_depth, limit, cycle_guard, count, shown_impl_for
                     )
 
                 # Recurse for children
@@ -620,6 +936,9 @@ class ContextQuery(Query[ContextResult]):
                     entry.children = build_tree(target_id, current_depth + 1)
 
                 entries.append(entry)
+
+            # R2: Sort entries by (file path, line number) for consistent ordering
+            entries.sort(key=lambda e: (e.file or "", e.line if e.line is not None else 0))
 
             return entries
 
@@ -767,10 +1086,13 @@ class ContextQuery(Query[ContextResult]):
 
                 reference_type = None
                 access_chain = None
+                access_chain_symbol = None
 
                 if call_node_id:
                     reference_type = get_reference_type_from_call(self.index, call_node_id)
                     access_chain = build_access_chain(self.index, call_node_id)
+                    # R4: Resolve access chain property FQN
+                    access_chain_symbol = resolve_access_chain_symbol(self.index, call_node_id)
                 else:
                     # Fall back to inference from edge/node types
                     reference_type = _infer_reference_type(edge, target_node)
@@ -784,6 +1106,7 @@ class ContextQuery(Query[ContextResult]):
                     line=line,
                     reference_type=reference_type,
                     access_chain=access_chain,
+                    access_chain_symbol=access_chain_symbol,
                 )
 
             entry = ContextEntry(
@@ -814,6 +1137,9 @@ class ContextQuery(Query[ContextResult]):
                 )
 
             entries.append(entry)
+
+        # R2: Sort entries by (file path, line number) for consistent ordering
+        entries.sort(key=lambda e: (e.file or "", e.line if e.line is not None else 0))
 
         return entries
 

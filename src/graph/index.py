@@ -450,6 +450,49 @@ class SoTIndex:
         """Get all Call node IDs that call a given Method/Property/Class."""
         return [e.source for e in self.incoming[target_node_id].get("calls", [])]
 
+    def resolve_file_to_class(self, file_node_id: str) -> Optional[str]:
+        """Resolve a File node to its primary contained Class/Interface/Trait/Enum (R6).
+
+        Resolution rules:
+        - Single class -> use that class
+        - Multiple classes -> use the one whose name matches the filename (PSR-4)
+        - No class (script file) -> return None (caller keeps file path)
+
+        Args:
+            file_node_id: ID of the File node.
+
+        Returns:
+            Node ID of the primary class, or None if no class found.
+        """
+        file_node = self.nodes.get(file_node_id)
+        if not file_node or file_node.kind != "File":
+            return None
+
+        children = self.get_contains_children(file_node_id)
+        class_children = []
+        for child_id in children:
+            child_node = self.nodes.get(child_id)
+            if child_node and child_node.kind in ("Class", "Interface", "Trait", "Enum"):
+                class_children.append(child_id)
+
+        if not class_children:
+            return None
+
+        if len(class_children) == 1:
+            return class_children[0]
+
+        # Multiple classes: find the one matching the filename (PSR-4 convention)
+        if file_node.file:
+            import os
+            filename = os.path.splitext(os.path.basename(file_node.file))[0]
+            for child_id in class_children:
+                child_node = self.nodes.get(child_id)
+                if child_node and child_node.name == filename:
+                    return child_id
+
+        # Fallback: return the first class
+        return class_children[0]
+
     def get_arguments(self, call_node_id: str) -> list[tuple[str, int]]:
         """Get argument Value node IDs with their positions for a Call node.
 
