@@ -144,6 +144,132 @@ def _format_entry_name(entry) -> str:
     return entry.fqn
 
 
+def _format_argument_lines(arg, indent: str = "          ") -> str:
+    """Format a single argument with rich ISSUE-D display.
+
+    Format: param_fqn (type): `expression` ref_symbol
+    With optional source_chain expansion below.
+    """
+    # Build param label: prefer param_fqn, fall back to param_name
+    param = arg.param_fqn or arg.param_name or f"arg[{arg.position}]"
+    type_suffix = f" ({arg.value_type})" if arg.value_type else ""
+    value = arg.value_expr or "?"
+
+    # Build reference suffix
+    ref_suffix = ""
+    if arg.value_ref_symbol:
+        ref_suffix = f" {arg.value_ref_symbol}"
+    elif arg.value_source == "literal":
+        ref_suffix = " literal"
+
+    line = f"\n{indent}{param}{type_suffix}: `{value}`{ref_suffix}"
+
+    # Expand source chain if present
+    if arg.source_chain:
+        for step in arg.source_chain:
+            step_fqn = step.get("fqn", "?")
+            step_ref = f" [cyan]\\[{step['reference_type']}][/cyan]" if step.get("reference_type") else ""
+            line += f"\n{indent}    [dim]source:[/dim] {step_fqn}{step_ref}"
+            if step.get("on"):
+                line += f"\n{indent}        [dim]on:[/dim] [green]{step['on']}[/green]"
+
+    return line
+
+
+def print_definition_section(result: ContextResult, console: Console):
+    """Print the DEFINITION section for a context query result.
+
+    Shows structural information about the queried symbol: signature,
+    typed arguments, return type, containing class, properties, methods,
+    and inheritance relationships.
+
+    Args:
+        result: ContextResult with definition info.
+        console: Rich console for output.
+    """
+    defn = result.definition
+    if not defn:
+        return
+
+    console.print("[bold cyan]== DEFINITION ==[/bold cyan]")
+
+    # Show signature for methods/functions
+    if defn.signature:
+        console.print(f"[bold]{defn.signature}[/bold]")
+    else:
+        console.print(f"[bold]{defn.kind}[/bold]: {defn.fqn}")
+
+    # Show typed arguments for methods/functions
+    if defn.arguments:
+        console.print("  [dim]Arguments:[/dim]")
+        for arg in defn.arguments:
+            arg_name = arg.get("name", "?")
+            arg_type = arg.get("type")
+            if arg_type:
+                console.print(f"    {arg_name}: {arg_type}")
+            else:
+                console.print(f"    {arg_name}")
+
+    # Show return type for methods/functions
+    if defn.return_type:
+        type_name = defn.return_type.get("name", defn.return_type.get("fqn", "?"))
+        console.print(f"  [dim]Return type:[/dim] {type_name}")
+
+    # Show type for properties/arguments (reuses return_type field)
+    if defn.kind in ("Property", "Argument") and defn.return_type:
+        type_name = defn.return_type.get("name", defn.return_type.get("fqn", "?"))
+        console.print(f"  [dim]Type:[/dim] {type_name}")
+
+    # Show properties for classes
+    if defn.properties:
+        console.print("  [dim]Properties:[/dim]")
+        for prop in defn.properties:
+            prop_name = prop.get("name", "?")
+            prop_type = prop.get("type")
+            if prop_type:
+                console.print(f"    {prop_name}: {prop_type}")
+            else:
+                console.print(f"    {prop_name}")
+
+    # Show methods for classes
+    if defn.methods:
+        console.print("  [dim]Methods:[/dim]")
+        for method in defn.methods:
+            sig = method.get("signature")
+            if sig:
+                console.print(f"    {sig}")
+            else:
+                console.print(f"    {method.get('name', '?')}()")
+
+    # Show inheritance
+    if defn.extends:
+        console.print(f"  [dim]Extends:[/dim] {defn.extends}")
+    if defn.implements:
+        console.print(f"  [dim]Implements:[/dim] {', '.join(defn.implements)}")
+    if defn.uses_traits:
+        console.print(f"  [dim]Uses traits:[/dim] {', '.join(defn.uses_traits)}")
+
+    # Show declared-in
+    if defn.declared_in:
+        declared_fqn = defn.declared_in.get("fqn", "?")
+        declared_file = defn.declared_in.get("file")
+        declared_line = defn.declared_in.get("line")
+        location = ""
+        if declared_file:
+            location = f" ({declared_file}"
+            if declared_line is not None:
+                location += f":{declared_line + 1}"
+            location += ")"
+        console.print(f"  [dim]Defined in:[/dim] {declared_fqn}{location}")
+    elif defn.file:
+        location = defn.file
+        if defn.line is not None:
+            location += f":{defn.line + 1}"
+        console.print(f"  [dim]Defined at:[/dim] {location}")
+
+    console.print()
+
+
 def print_context_tree(result: ContextResult, console: Console):
     """Print context (used_by and uses) as nested trees.
 
@@ -172,37 +298,59 @@ def print_context_tree(result: ContextResult, console: Console):
                     add_context_children(branch, entry.children, show_impl)
                 continue
 
-            display_name = _format_entry_name(entry)
-            label = f"[dim]\\[{entry.depth}][/dim] {display_name}"
-            # Append member ref inline: "source -> member [reference_type]"
-            if entry.member_ref:
-                # For member references, show the member name
-                if entry.member_ref.target_name:
-                    label += f" [bold yellow]->[/bold yellow] [yellow]{entry.member_ref.target_name}[/yellow]"
-                # Add reference type indicator (escape brackets for Rich)
-                if entry.member_ref.reference_type:
-                    label += f" [cyan]\\[{entry.member_ref.reference_type}][/cyan]"
-            if entry.file and entry.line is not None:
-                label += f" [dim]({entry.file}:{entry.line + 1})[/dim]"
-            elif entry.file:
-                label += f" [dim]({entry.file})[/dim]"
-            # Add access chain on a new line if present
-            if entry.member_ref and entry.member_ref.access_chain:
-                chain_text = entry.member_ref.access_chain
-                # R4: Include property FQN in parentheses after access chain if available
-                if entry.member_ref.access_chain_symbol:
-                    chain_text += f" ({entry.member_ref.access_chain_symbol})"
-                label += f"\n        [dim]on:[/dim] [green]{chain_text}[/green]"
-            # Show argument-to-parameter mappings if present
-            if entry.arguments:
-                label += "\n        [dim]args:[/dim]"
-                for arg in entry.arguments:
-                    param = arg.param_name or f"arg[{arg.position}]"
-                    value = arg.value_expr or "?"
-                    label += f"\n          {param} <- {value}"
-            # Show result variable if present
-            if entry.result_var:
-                label += f"\n        [dim]result ->[/dim] [green]{entry.result_var}[/green]"
+            # Kind 1: Variable entry (local_variable)
+            if entry.entry_type == "local_variable":
+                var_type_str = f" ({entry.variable_type})" if entry.variable_type else ""
+                label = f"[dim]\\[{entry.depth}][/dim] [bold green]{entry.variable_name}[/bold green]{var_type_str} [cyan]\\[variable][/cyan]"
+                if entry.file and entry.line is not None:
+                    label += f" [dim]({entry.file}:{entry.line + 1})[/dim]"
+                elif entry.file:
+                    label += f" [dim]({entry.file})[/dim]"
+                # Show nested source call
+                if entry.source_call:
+                    sc = entry.source_call
+                    sc_ref_type = f" [cyan]\\[{sc.member_ref.reference_type}][/cyan]" if sc.member_ref and sc.member_ref.reference_type else ""
+                    label += f"\n        [dim]source:[/dim] {sc.fqn}{sc_ref_type}"
+                    if sc.member_ref and sc.member_ref.access_chain:
+                        chain_text = sc.member_ref.access_chain
+                        if sc.member_ref.access_chain_symbol:
+                            chain_text += f" ({sc.member_ref.access_chain_symbol})"
+                        label += f"\n          [dim]on:[/dim] [green]{chain_text}[/green]"
+                    if sc.arguments:
+                        label += "\n          [dim]args:[/dim]"
+                        for arg in sc.arguments:
+                            label += _format_argument_lines(arg, indent="            ")
+            else:
+                # Kind 2: Call entry (or type reference without entry_type)
+                display_name = _format_entry_name(entry)
+                label = f"[dim]\\[{entry.depth}][/dim] {display_name}"
+                # Append member ref inline: "source -> member [reference_type]"
+                if entry.member_ref:
+                    # For member references, show the member name
+                    if entry.member_ref.target_name:
+                        label += f" [bold yellow]->[/bold yellow] [yellow]{entry.member_ref.target_name}[/yellow]"
+                    # Add reference type indicator (escape brackets for Rich)
+                    if entry.member_ref.reference_type:
+                        label += f" [cyan]\\[{entry.member_ref.reference_type}][/cyan]"
+                if entry.file and entry.line is not None:
+                    label += f" [dim]({entry.file}:{entry.line + 1})[/dim]"
+                elif entry.file:
+                    label += f" [dim]({entry.file})[/dim]"
+                # Add access chain on a new line if present
+                if entry.member_ref and entry.member_ref.access_chain:
+                    chain_text = entry.member_ref.access_chain
+                    # R4: Include property FQN in parentheses after access chain if available
+                    if entry.member_ref.access_chain_symbol:
+                        chain_text += f" ({entry.member_ref.access_chain_symbol})"
+                    label += f"\n        [dim]on:[/dim] [green]{chain_text}[/green]"
+                # Show argument-to-parameter mappings if present
+                if entry.arguments:
+                    label += "\n        [dim]args:[/dim]"
+                    for arg in entry.arguments:
+                        label += _format_argument_lines(arg, indent="          ")
+                # Show result variable if present
+                if entry.result_var:
+                    label += f"\n        [dim]result ->[/dim] [green]{entry.result_var}[/green]"
 
             branch = parent.add(label)
 
@@ -231,6 +379,10 @@ def print_context_tree(result: ContextResult, console: Console):
     console.print(f"[dim]defined at: {result.target.location_str}[/dim]")
     console.print()
 
+    # Print DEFINITION section (before USED BY)
+    if result.definition:
+        print_definition_section(result, console)
+
     # Print USED BY tree
     console.print("[bold cyan]== USED BY ==[/bold cyan]")
     if not result.used_by:
@@ -255,6 +407,23 @@ def print_context_tree(result: ContextResult, console: Console):
 def context_tree_to_dict(result: ContextResult) -> dict:
     """Convert context result to JSON-serializable dict with nested tree structure."""
     from ..models import ContextEntry
+
+    def _argument_to_dict(a) -> dict:
+        d = {
+            "position": a.position,
+            "param_name": a.param_name,
+            "value_expr": a.value_expr,
+            "value_source": a.value_source,
+        }
+        if a.value_type is not None:
+            d["value_type"] = a.value_type
+        if a.param_fqn is not None:
+            d["param_fqn"] = a.param_fqn
+        if a.value_ref_symbol is not None:
+            d["value_ref_symbol"] = a.value_ref_symbol
+        if a.source_chain is not None:
+            d["source_chain"] = a.source_chain
+        return d
 
     def context_entry_to_dict(entry: ContextEntry) -> dict:
         d = {
@@ -296,17 +465,23 @@ def context_tree_to_dict(result: ContextResult) -> dict:
         # Include arguments if present
         if entry.arguments:
             d["arguments"] = [
-                {
-                    "position": a.position,
-                    "param_name": a.param_name,
-                    "value_expr": a.value_expr,
-                    "value_source": a.value_source,
-                }
+                _argument_to_dict(a)
                 for a in entry.arguments
             ]
         # Include result_var if present
         if entry.result_var:
             d["result_var"] = entry.result_var
+        # ISSUE-C: Include entry_type and variable fields
+        if entry.entry_type:
+            d["entry_type"] = entry.entry_type
+        if entry.variable_name:
+            d["variable_name"] = entry.variable_name
+        if entry.variable_symbol:
+            d["variable_symbol"] = entry.variable_symbol
+        if entry.variable_type:
+            d["variable_type"] = entry.variable_type
+        if entry.source_call:
+            d["source_call"] = context_entry_to_dict(entry.source_call)
         return d
 
     target_dict = {
@@ -318,12 +493,42 @@ def context_tree_to_dict(result: ContextResult) -> dict:
     if result.target.signature:
         target_dict["signature"] = result.target.signature
 
-    return {
+    d = {
         "target": target_dict,
         "max_depth": result.max_depth,
         "used_by": [context_entry_to_dict(e) for e in result.used_by],
         "uses": [context_entry_to_dict(e) for e in result.uses],
     }
+
+    if result.definition:
+        defn = result.definition
+        defn_dict = {
+            "fqn": defn.fqn,
+            "kind": defn.kind,
+            "file": defn.file,
+            "line": defn.line + 1 if defn.line is not None else None,
+        }
+        if defn.signature:
+            defn_dict["signature"] = defn.signature
+        if defn.arguments:
+            defn_dict["arguments"] = defn.arguments
+        if defn.return_type:
+            defn_dict["return_type"] = defn.return_type
+        if defn.declared_in:
+            defn_dict["declared_in"] = defn.declared_in
+        if defn.properties:
+            defn_dict["properties"] = defn.properties
+        if defn.methods:
+            defn_dict["methods"] = defn.methods
+        if defn.extends:
+            defn_dict["extends"] = defn.extends
+        if defn.implements:
+            defn_dict["implements"] = defn.implements
+        if defn.uses_traits:
+            defn_dict["uses_traits"] = defn.uses_traits
+        d["definition"] = defn_dict
+
+    return d
 
 
 def print_owners_tree(result: OwnersResult, console: Console):

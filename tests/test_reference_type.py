@@ -304,3 +304,120 @@ class TestInferReferenceTypeWithIndex:
 
         index = _MockIndex({"class:Child": source})
         assert _infer_reference_type(edge, target, index) == "extends"
+
+
+class _ArgumentMockIndex:
+    """Mock index for testing _get_argument_info() expression preference.
+
+    Supports get_arguments(), get_call_target(), get_contains_children(),
+    and nodes dict.
+    """
+
+    def __init__(self, nodes: dict[str, NodeData], arguments: dict[str, list] = None,
+                 call_targets: dict[str, str] = None, contains: dict[str, list[str]] = None):
+        from collections import defaultdict
+        self.nodes = nodes
+        self._arguments = arguments or {}
+        self._call_targets = call_targets or {}
+        self._contains = contains or {}
+        self.outgoing = defaultdict(lambda: defaultdict(list))
+        self.incoming = defaultdict(lambda: defaultdict(list))
+
+    def get_arguments(self, call_node_id: str):
+        return self._arguments.get(call_node_id, [])
+
+    def get_call_target(self, call_node_id: str):
+        return self._call_targets.get(call_node_id)
+
+    def get_contains_children(self, node_id: str):
+        return self._contains.get(node_id, [])
+
+    def get_type_of_all(self, value_node_id: str):
+        return []
+
+    def get_receiver(self, call_node_id: str):
+        return None
+
+
+class TestExpressionPreference:
+    """Tests for _get_argument_info() expression preference (ISSUE-A, Phase 1).
+
+    When an argument edge has an expression field, _get_argument_info() should
+    use it for value_expr. When expression is None, it falls back to the
+    Value node's name.
+    """
+
+    def test_expression_preferred_over_node_name(self):
+        """Expression from edge is used when available, even if node has a name."""
+        from src.queries.context import ContextQuery
+
+        # Create a Value node with name "(result)" — the old fallback
+        value_node = make_node("Value", "(result)", "result#1")
+        value_node.id = "value:1"
+        value_node.kind = "Value"
+        value_node.value_kind = "result"
+
+        index = _ArgumentMockIndex(
+            nodes={"value:1": value_node},
+            arguments={"call:1": [("value:1", 0, "$input->productId")]},
+            call_targets={},
+        )
+
+        query = ContextQuery.__new__(ContextQuery)
+        query.index = index
+
+        args = query._get_argument_info("call:1")
+        assert len(args) == 1
+        assert args[0].value_expr == "$input->productId", (
+            f"Should use expression '$input->productId', got '{args[0].value_expr}'"
+        )
+        assert args[0].value_source == "result"
+
+    def test_fallback_to_node_name_when_no_expression(self):
+        """Falls back to Value node name when expression is None."""
+        from src.queries.context import ContextQuery
+
+        value_node = make_node("Value", "$order", "local#32$order")
+        value_node.id = "value:2"
+        value_node.kind = "Value"
+        value_node.value_kind = "local"
+
+        index = _ArgumentMockIndex(
+            nodes={"value:2": value_node},
+            arguments={"call:2": [("value:2", 0, None)]},
+            call_targets={},
+        )
+
+        query = ContextQuery.__new__(ContextQuery)
+        query.index = index
+
+        args = query._get_argument_info("call:2")
+        assert len(args) == 1
+        assert args[0].value_expr == "$order", (
+            f"Should fall back to node name '$order', got '{args[0].value_expr}'"
+        )
+        assert args[0].value_source == "local"
+
+    def test_empty_string_expression_falls_back_to_node_name(self):
+        """Empty string expression is falsy, so falls back to node name."""
+        from src.queries.context import ContextQuery
+
+        value_node = make_node("Value", "(literal)", "literal#5")
+        value_node.id = "value:3"
+        value_node.kind = "Value"
+        value_node.value_kind = "literal"
+
+        index = _ArgumentMockIndex(
+            nodes={"value:3": value_node},
+            arguments={"call:3": [("value:3", 0, "")]},
+            call_targets={},
+        )
+
+        query = ContextQuery.__new__(ContextQuery)
+        query.index = index
+
+        args = query._get_argument_info("call:3")
+        assert len(args) == 1
+        assert args[0].value_expr == "(literal)", (
+            f"Empty expression should fall back to '(literal)', got '{args[0].value_expr}'"
+        )

@@ -119,6 +119,11 @@ class ArgumentInfo:
     param_name: Optional[str] = None  # Formal parameter name from callee (e.g., "$productId")
     value_expr: Optional[str] = None  # Source expression text (e.g., "$input->productId")
     value_source: Optional[str] = None  # Value kind: "parameter", "local", "literal", "result"
+    value_type: Optional[str] = None  # Resolved type name(s) from type_of edges (e.g., "Order", "int|string")
+    # ISSUE-D: Rich argument display
+    param_fqn: Optional[str] = None  # Full FQN of callee's Argument node (e.g., "Order::__construct().$id")
+    value_ref_symbol: Optional[str] = None  # Graph symbol the value resolves to (e.g., "local#32$order")
+    source_chain: Optional[list] = None  # Access chain steps when value has no top-level entry
 
 
 @dataclass
@@ -145,6 +150,12 @@ class ContextEntry:
     arguments: list["ArgumentInfo"] = field(default_factory=list)
     # Phase 2: Name of local variable that receives this call's result
     result_var: Optional[str] = None
+    # ISSUE-C: Variable-centric flow — entry type and variable metadata
+    entry_type: Optional[str] = None  # "call" or "local_variable"
+    variable_name: Optional[str] = None  # "$order" for Kind 1 entries
+    variable_symbol: Optional[str] = None  # "local#32$order" for Kind 1 entries
+    variable_type: Optional[str] = None  # "Order" for Kind 1 entries
+    source_call: Optional["ContextEntry"] = None  # Nested call for Kind 1 entries
 
 
 @dataclass
@@ -155,6 +166,7 @@ class ContextResult:
     max_depth: int
     used_by: list[ContextEntry] = field(default_factory=list)
     uses: list[ContextEntry] = field(default_factory=list)
+    definition: Optional["DefinitionInfo"] = None
 
 
 @dataclass
@@ -227,3 +239,27 @@ class OverridesResult:
     root: NodeData
     direction: str
     chain: list[NodeData]
+
+
+@dataclass
+class DefinitionInfo:
+    """Symbol definition metadata for the DEFINITION section.
+
+    Provides structural information about a symbol: its signature, typed
+    arguments, return type, containing class, properties, methods, and
+    inheritance relationships.
+    """
+
+    fqn: str
+    kind: str
+    file: Optional[str] = None
+    line: Optional[int] = None
+    signature: Optional[str] = None
+    arguments: list[dict] = field(default_factory=list)
+    return_type: Optional[dict] = None
+    declared_in: Optional[dict] = None
+    properties: list[dict] = field(default_factory=list)
+    methods: list[dict] = field(default_factory=list)
+    extends: Optional[str] = None
+    implements: list[str] = field(default_factory=list)
+    uses_traits: list[str] = field(default_factory=list)

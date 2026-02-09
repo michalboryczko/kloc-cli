@@ -54,6 +54,7 @@ class EdgeSpec(msgspec.Struct, omit_defaults=True):
     target: str
     location: Optional[dict] = None  # Keep as dict for compatibility
     position: Optional[int] = None   # For argument edges: 0-based argument index
+    expression: Optional[str] = None  # For argument edges: source expression text
 
 
 class SoTSpec(msgspec.Struct, omit_defaults=True):
@@ -115,6 +116,7 @@ def load_sot(path: str | Path) -> dict[str, Any]:
                 "target": e.target,
                 "location": e.location,
                 "position": e.position,
+                "expression": e.expression,
             }
             for e in data.edges
         ],

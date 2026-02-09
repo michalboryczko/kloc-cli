@@ -2,7 +2,7 @@
 
 from typing import Optional, TYPE_CHECKING
 
-from ..models import ContextResult, ContextEntry, MemberRef, InheritEntry, OverrideEntry, NodeData, ArgumentInfo
+from ..models import ContextResult, ContextEntry, MemberRef, InheritEntry, OverrideEntry, NodeData, ArgumentInfo, DefinitionInfo
 from ..models.edge import EdgeData
 from .base import Query
 
@@ -498,6 +498,7 @@ class ContextQuery(Query[ContextResult]):
         if not target_node:
             raise ValueError(f"Node not found: {node_id}")
 
+        definition = self._build_definition(node_id)
         used_by = self._build_incoming_tree(
             node_id, depth, limit, include_impl, direct_only, with_imports
         )
@@ -508,6 +509,7 @@ class ContextQuery(Query[ContextResult]):
             max_depth=depth,
             used_by=used_by,
             uses=uses,
+            definition=definition,
         )
 
     @staticmethod
@@ -519,6 +521,139 @@ class ContextQuery(Query[ContextResult]):
             name = node.name
             return name if name.startswith("$") else f"${name}"
         return node.name
+
+    def _build_definition(self, node_id: str) -> DefinitionInfo:
+        """Build definition metadata for a symbol.
+
+        Gathers structural information about the symbol: signature, typed
+        arguments, return type, containing class, properties, methods,
+        and inheritance relationships.
+
+        Args:
+            node_id: The node to build definition for.
+
+        Returns:
+            DefinitionInfo with symbol metadata.
+        """
+        node = self.index.nodes.get(node_id)
+        if not node:
+            return DefinitionInfo(fqn="unknown", kind="unknown")
+
+        info = DefinitionInfo(
+            fqn=node.fqn,
+            kind=node.kind,
+            file=node.file,
+            line=node.start_line,
+            signature=node.signature,
+        )
+
+        # Resolve containing class/method
+        parent_id = self.index.get_contains_parent(node_id)
+        if parent_id:
+            parent_node = self.index.nodes.get(parent_id)
+            if parent_node:
+                info.declared_in = {
+                    "fqn": parent_node.fqn,
+                    "kind": parent_node.kind,
+                    "file": parent_node.file,
+                    "line": parent_node.start_line,
+                }
+
+        if node.kind in ("Method", "Function"):
+            self._build_method_definition(node_id, node, info)
+        elif node.kind in ("Class", "Interface", "Trait", "Enum"):
+            self._build_class_definition(node_id, node, info)
+        elif node.kind == "Property":
+            self._build_property_definition(node_id, node, info)
+        elif node.kind == "Argument":
+            self._build_argument_definition(node_id, node, info)
+
+        return info
+
+    def _build_method_definition(self, node_id: str, node: NodeData, info: DefinitionInfo):
+        """Populate definition for Method/Function nodes."""
+        children = self.index.get_contains_children(node_id)
+
+        # Collect typed arguments
+        for child_id in children:
+            child = self.index.nodes.get(child_id)
+            if child and child.kind == "Argument":
+                arg_dict: dict = {"name": child.name, "position": None}
+                # Resolve type from type_hint edges
+                type_edges = self.index.outgoing[child_id].get("type_hint", [])
+                if type_edges:
+                    type_node = self.index.nodes.get(type_edges[0].target)
+                    if type_node:
+                        arg_dict["type"] = type_node.name
+                info.arguments.append(arg_dict)
+
+        # Resolve return type from type_hint edges on the method itself
+        type_edges = self.index.outgoing[node_id].get("type_hint", [])
+        if type_edges:
+            type_node = self.index.nodes.get(type_edges[0].target)
+            if type_node:
+                info.return_type = {"fqn": type_node.fqn, "name": type_node.name}
+
+    def _build_class_definition(self, node_id: str, node: NodeData, info: DefinitionInfo):
+        """Populate definition for Class/Interface/Trait/Enum nodes."""
+        children = self.index.get_contains_children(node_id)
+
+        for child_id in children:
+            child = self.index.nodes.get(child_id)
+            if not child:
+                continue
+
+            if child.kind == "Property":
+                prop_dict: dict = {"name": child.name}
+                type_edges = self.index.outgoing[child_id].get("type_hint", [])
+                if type_edges:
+                    type_node = self.index.nodes.get(type_edges[0].target)
+                    if type_node:
+                        prop_dict["type"] = type_node.name
+                info.properties.append(prop_dict)
+
+            elif child.kind == "Method":
+                method_dict: dict = {"name": child.name}
+                if child.signature:
+                    method_dict["signature"] = child.signature
+                info.methods.append(method_dict)
+
+        # Inheritance: extends
+        extends_id = self.index.get_extends_parent(node_id)
+        if extends_id:
+            extends_node = self.index.nodes.get(extends_id)
+            if extends_node:
+                info.extends = extends_node.fqn
+
+        # Inheritance: implements
+        impl_ids = self.index.get_implements(node_id)
+        for impl_id in impl_ids:
+            impl_node = self.index.nodes.get(impl_id)
+            if impl_node:
+                info.implements.append(impl_node.fqn)
+
+        # Traits: uses_trait
+        trait_edges = self.index.outgoing[node_id].get("uses_trait", [])
+        for edge in trait_edges:
+            trait_node = self.index.nodes.get(edge.target)
+            if trait_node:
+                info.uses_traits.append(trait_node.fqn)
+
+    def _build_property_definition(self, node_id: str, node: NodeData, info: DefinitionInfo):
+        """Populate definition for Property nodes."""
+        type_edges = self.index.outgoing[node_id].get("type_hint", [])
+        if type_edges:
+            type_node = self.index.nodes.get(type_edges[0].target)
+            if type_node:
+                info.return_type = {"fqn": type_node.fqn, "name": type_node.name}
+
+    def _build_argument_definition(self, node_id: str, node: NodeData, info: DefinitionInfo):
+        """Populate definition for Argument nodes."""
+        type_edges = self.index.outgoing[node_id].get("type_hint", [])
+        if type_edges:
+            type_node = self.index.nodes.get(type_edges[0].target)
+            if type_node:
+                info.return_type = {"fqn": type_node.fqn, "name": type_node.name}
 
     def _build_incoming_tree(
         self, start_id: str, max_depth: int, limit: int, include_impl: bool = False,
@@ -929,44 +1064,158 @@ class ContextQuery(Query[ContextResult]):
         Returns:
             Local variable name (e.g., "$order") or None if no assignment.
         """
-        result_id = self.index.get_produces(call_node_id)
-        if not result_id:
-            return None
-        # Find locals assigned from this result value.
-        # Edge direction: local_value --assigned_from--> result_value
-        # So incoming[result_id]["assigned_from"] gives edges where target=result_id
-        for edge in self.index.incoming[result_id].get("assigned_from", []):
-            source_node = self.index.nodes.get(edge.source)
-            if source_node and source_node.kind == "Value" and source_node.value_kind == "local":
-                return source_node.name
-        return None
+        local_node = self._find_local_value_for_call(call_node_id)
+        return local_node.name if local_node else None
 
-    def _get_argument_info(self, call_node_id: str) -> list:
-        """Get argument-to-parameter mappings for a Call node.
+    def _find_local_value_for_call(self, call_node_id: str):
+        """Find the local Value node assigned from this call's result.
 
-        Returns a list of ArgumentInfo instances (or empty list if ArgumentInfo
-        is not yet available or the call has no arguments).
+        Follows: Call --produces--> Value (result) <--assigned_from-- Value (local)
 
         Args:
             call_node_id: ID of the Call node.
 
         Returns:
-            List of ArgumentInfo instances with position, param_name, value_expr, value_source.
+            NodeData for the local Value node, or None if no assignment.
+        """
+        result_id = self.index.get_produces(call_node_id)
+        if not result_id:
+            return None
+        for edge in self.index.incoming[result_id].get("assigned_from", []):
+            source_node = self.index.nodes.get(edge.source)
+            if source_node and source_node.kind == "Value" and source_node.value_kind == "local":
+                return source_node
+        return None
+
+    def _get_argument_info(self, call_node_id: str) -> list:
+        """Get argument-to-parameter mappings for a Call node.
+
+        Returns a list of ArgumentInfo instances with position, param_name,
+        value_expr, value_source, value_type, param_fqn, value_ref_symbol,
+        and source_chain.
+
+        Args:
+            call_node_id: ID of the Call node.
+
+        Returns:
+            List of ArgumentInfo instances.
         """
 
         arg_edges = self.index.get_arguments(call_node_id)
         arguments = []
-        for arg_node_id, position in arg_edges:
+        for arg_node_id, position, expression in arg_edges:
             arg_node = self.index.nodes.get(arg_node_id)
             if arg_node:
                 param_name = self._resolve_param_name(call_node_id, position)
+                param_fqn = self._resolve_param_fqn(call_node_id, position)
+
+                # Resolve value type via type_of edges
+                value_type = None
+                type_ids = self.index.get_type_of_all(arg_node_id)
+                if type_ids:
+                    type_names = []
+                    for tid in type_ids:
+                        tnode = self.index.nodes.get(tid)
+                        if tnode:
+                            type_names.append(tnode.name)
+                    if type_names:
+                        value_type = "|".join(type_names)
+
+                # ISSUE-D: Resolve value_ref_symbol and source_chain
+                value_ref_symbol = None
+                source_chain = None
+                if arg_node.value_kind == "local":
+                    # Local variable — reference by graph symbol
+                    value_ref_symbol = arg_node.fqn
+                elif arg_node.value_kind == "parameter":
+                    # Method parameter — reference by graph symbol
+                    value_ref_symbol = arg_node.fqn
+                elif arg_node.value_kind == "result":
+                    # Result of another call — trace source chain
+                    source_chain = self._trace_source_chain(arg_node_id)
+
                 arguments.append(ArgumentInfo(
                     position=position,
                     param_name=param_name,
-                    value_expr=arg_node.name,
+                    value_expr=expression or arg_node.name,
                     value_source=arg_node.value_kind,
+                    value_type=value_type,
+                    param_fqn=param_fqn,
+                    value_ref_symbol=value_ref_symbol,
+                    source_chain=source_chain,
                 ))
         return arguments
+
+    def _resolve_param_fqn(self, call_node_id: str, position: int) -> Optional[str]:
+        """Get the formal parameter FQN at the given position from the callee.
+
+        Args:
+            call_node_id: ID of the Call node.
+            position: 0-based argument position.
+
+        Returns:
+            Parameter FQN string or None.
+        """
+        target_id = self.index.get_call_target(call_node_id)
+        if not target_id:
+            return None
+        children = self.index.get_contains_children(target_id)
+        arg_nodes = []
+        for child_id in children:
+            child = self.index.nodes.get(child_id)
+            if child and child.kind == "Argument":
+                arg_nodes.append(child)
+        if position < len(arg_nodes):
+            return arg_nodes[position].fqn
+        return None
+
+    def _trace_source_chain(self, value_node_id: str) -> Optional[list]:
+        """Trace the source chain for a result Value node.
+
+        For property access results, follows the receiver chain to build
+        a source chain showing what property is accessed on what object.
+
+        Args:
+            value_node_id: ID of the result Value node.
+
+        Returns:
+            List of chain step dicts, or None if chain cannot be traced.
+        """
+        # Find the Call that produces this result value
+        # Result values have incoming 'produces' from their Call
+        for edge in self.index.incoming[value_node_id].get("produces", []):
+            call_id = edge.source
+            call_node = self.index.nodes.get(call_id)
+            if not call_node:
+                continue
+
+            target_id = self.index.get_call_target(call_id)
+            if not target_id:
+                continue
+            target_node = self.index.nodes.get(target_id)
+            if not target_node:
+                continue
+
+            # Build chain step
+            step = {
+                "fqn": target_node.fqn,
+                "kind": target_node.kind,
+            }
+            ref_type = None
+            if call_node.call_kind:
+                ref_type = call_node.call_kind
+            step["reference_type"] = ref_type
+
+            # Add receiver info if available
+            recv_id = self.index.get_receiver(call_id)
+            if recv_id:
+                recv_node = self.index.nodes.get(recv_id)
+                if recv_node:
+                    step["on"] = recv_node.fqn
+
+            return [step]
+
+        return None
 
     def _get_type_references(
         self, method_id: str, depth: int, cycle_guard: set, count: list, limit: int
@@ -1051,13 +1300,18 @@ class ContextQuery(Query[ContextResult]):
         limit: int, cycle_guard: set, count: list,
         include_impl: bool = False, shown_impl_for: set | None = None,
     ) -> list[ContextEntry]:
-        """Build execution flow for a method by iterating its Call children.
+        """Build variable-centric execution flow for a method.
 
-        Instead of following `uses` edges (structural), this iterates the
-        method's Call node children in line-number order (behavioral). This
-        gives an execution-flow view that shows what the method actually does:
-        which methods it calls, in what order, with what arguments, and what
-        variables receive the results.
+        Produces two kinds of entries:
+        - Kind 1 (local_variable): When a call result is assigned to a local
+          variable. The variable is the primary entry; the call is nested as
+          source_call.
+        - Kind 2 (call): When a call result is discarded (void/unused). The
+          call is the primary entry, same as before.
+
+        Calls consumed as receivers or argument sources by other calls in the
+        same method are NOT top-level entries — they appear nested inside the
+        consuming entry's access chain or argument source chain.
 
         Args:
             method_id: The Method/Function node ID to build flow for.
@@ -1076,14 +1330,42 @@ class ContextQuery(Query[ContextResult]):
             shown_impl_for = set()
 
         children = self.index.get_contains_children(method_id)
-        entries = []
 
-        # Per-parent dedup: prevent showing the same callee twice within this method
-        local_visited: set[str] = set()
-
+        # Step 1: Collect all Call children
+        call_children = []
         for child_id in children:
             child = self.index.nodes.get(child_id)
-            if not child or child.kind != "Call":
+            if child and child.kind == "Call":
+                call_children.append((child_id, child))
+
+        # Step 2: Identify consumed calls — calls whose result Value is used
+        # as a receiver or argument source by another call in the same method.
+        consumed: set[str] = set()
+        for call_id, call_node in call_children:
+            # Check receiver: if the receiver Value is a result of another call
+            recv_id = self.index.get_receiver(call_id)
+            if recv_id:
+                recv_node = self.index.nodes.get(recv_id)
+                if recv_node and recv_node.kind == "Value" and recv_node.value_kind == "result":
+                    source_call_id = self.index.get_source_call(recv_id)
+                    if source_call_id:
+                        consumed.add(source_call_id)
+            # Check arguments: if any arg Value is a result of another call
+            arg_edges = self.index.get_arguments(call_id)
+            for arg_id, _, _ in arg_edges:
+                arg_node = self.index.nodes.get(arg_id)
+                if arg_node and arg_node.value_kind == "result":
+                    src = self.index.get_source_call(arg_id)
+                    if src:
+                        consumed.add(src)
+
+        # Step 3: Build entries for non-consumed calls
+        entries = []
+        local_visited: set[str] = set()
+
+        for child_id, child in call_children:
+            # Skip consumed calls (they appear nested inside consuming entries)
+            if child_id in consumed:
                 continue
             if count[0] >= limit:
                 break
@@ -1099,7 +1381,6 @@ class ContextQuery(Query[ContextResult]):
             if not target_node:
                 continue
 
-            # Skip self-references (method calling itself is handled by cycle_guard)
             if target_id in cycle_guard:
                 continue
 
@@ -1108,8 +1389,6 @@ class ContextQuery(Query[ContextResult]):
             access_chain = build_access_chain(self.index, child_id)
             access_chain_symbol = resolve_access_chain_symbol(self.index, child_id)
             arguments = self._get_argument_info(child_id)
-            result_var = self._find_result_var(child_id)
-
             call_line = child.range.get("start_line") if child.range else None
 
             member_ref = MemberRef(
@@ -1123,28 +1402,93 @@ class ContextQuery(Query[ContextResult]):
                 access_chain_symbol=access_chain_symbol,
             )
 
-            entry_kwargs = dict(
-                depth=depth,
-                node_id=target_id,
-                fqn=target_node.fqn,
-                kind=target_node.kind,
-                file=child.file,
-                line=call_line,
-                signature=target_node.signature,
-                children=[],
-                implementations=[],
-                member_ref=member_ref,
-                arguments=arguments,
-                result_var=result_var,
-            )
-            entry = ContextEntry(**entry_kwargs)
+            # Check if this call's result is assigned to a local variable
+            local_value = self._find_local_value_for_call(child_id)
 
-            # Attach implementations for interface methods
-            if include_impl and target_node and target_id not in shown_impl_for:
-                shown_impl_for.add(target_id)
-                entry.implementations = self._get_implementations_for_node(
-                    target_node, depth, max_depth, limit, cycle_guard, count, shown_impl_for
+            if local_value:
+                # Kind 1: Variable entry with nested source_call
+                # Resolve variable type from type_of edge
+                var_type = None
+                type_of_edges = self.index.outgoing[local_value.id].get("type_of", [])
+                if type_of_edges:
+                    type_node = self.index.nodes.get(type_of_edges[0].target)
+                    if type_node:
+                        var_type = type_node.name
+
+                # Build the nested source_call entry (the call itself)
+                source_call_entry = ContextEntry(
+                    depth=depth,
+                    node_id=target_id,
+                    fqn=target_node.fqn,
+                    kind=target_node.kind,
+                    file=child.file,
+                    line=call_line,
+                    signature=target_node.signature,
+                    children=[],
+                    implementations=[],
+                    member_ref=member_ref,
+                    arguments=arguments,
+                    result_var=None,
+                    entry_type="call",
                 )
+
+                # Attach implementations to source_call
+                if include_impl and target_node and target_id not in shown_impl_for:
+                    shown_impl_for.add(target_id)
+                    source_call_entry.implementations = self._get_implementations_for_node(
+                        target_node, depth, max_depth, limit, cycle_guard, count, shown_impl_for
+                    )
+
+                # Variable symbol from local Value's FQN
+                var_symbol = local_value.fqn
+
+                var_line = local_value.range.get("start_line") if local_value.range else call_line
+
+                entry = ContextEntry(
+                    depth=depth,
+                    node_id=local_value.id,
+                    fqn=local_value.fqn,
+                    kind="Value",
+                    file=child.file,
+                    line=var_line,
+                    signature=None,
+                    children=[],
+                    implementations=[],
+                    member_ref=None,
+                    arguments=[],
+                    result_var=None,
+                    entry_type="local_variable",
+                    variable_name=local_value.name,
+                    variable_symbol=var_symbol,
+                    variable_type=var_type,
+                    source_call=source_call_entry,
+                )
+            else:
+                # Kind 2: Call entry (result discarded)
+                result_var = self._find_result_var(child_id)
+
+                entry = ContextEntry(
+                    depth=depth,
+                    node_id=target_id,
+                    fqn=target_node.fqn,
+                    kind=target_node.kind,
+                    file=child.file,
+                    line=call_line,
+                    signature=target_node.signature,
+                    children=[],
+                    implementations=[],
+                    member_ref=member_ref,
+                    arguments=arguments,
+                    result_var=result_var,
+                    entry_type="call",
+                )
+
+                # Attach implementations for interface methods
+                if include_impl and target_node and target_id not in shown_impl_for:
+                    shown_impl_for.add(target_id)
+                    entry.implementations = self._get_implementations_for_node(
+                        target_node, depth, max_depth, limit, cycle_guard, count, shown_impl_for
+                    )
 
             # Depth expansion: recurse into callee's execution flow
             if depth < max_depth and target_node.kind in ("Method", "Function"):

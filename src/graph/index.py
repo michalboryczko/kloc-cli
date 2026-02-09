@@ -62,6 +62,7 @@ class SoTIndex:
                 target=e["target"],
                 location=e.get("location"),
                 position=e.get("position"),
+                expression=e.get("expression"),
             )
             self.edges.append(edge)
 
@@ -446,6 +447,10 @@ class SoTIndex:
             return edges[0].target
         return None
 
+    def get_type_of_all(self, value_node_id: str) -> list[str]:
+        """Get all type (Class/Interface) node IDs for a Value node (supports union types)."""
+        return [e.target for e in self.outgoing[value_node_id].get("type_of", [])]
+
     def get_calls_to(self, target_node_id: str) -> list[str]:
         """Get all Call node IDs that call a given Method/Property/Class."""
         return [e.source for e in self.incoming[target_node_id].get("calls", [])]
@@ -493,12 +498,12 @@ class SoTIndex:
         # Fallback: return the first class
         return class_children[0]
 
-    def get_arguments(self, call_node_id: str) -> list[tuple[str, int]]:
+    def get_arguments(self, call_node_id: str) -> list[tuple[str, int, Optional[str]]]:
         """Get argument Value node IDs with their positions for a Call node.
 
         Returns:
-            List of (value_node_id, position) tuples sorted by position.
+            List of (value_node_id, position, expression) tuples sorted by position.
         """
         edges = self.outgoing[call_node_id].get("argument", [])
-        args = [(e.target, e.position or 0) for e in edges]
+        args = [(e.target, e.position or 0, e.expression) for e in edges]
         return sorted(args, key=lambda x: x[1])

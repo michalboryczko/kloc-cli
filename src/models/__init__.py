@@ -21,6 +21,7 @@ from .results import (
     OverrideEntry,
     OverridesTreeResult,
     OverridesResult,
+    DefinitionInfo,
 )
 
 __all__ = [
@@ -44,4 +45,5 @@ __all__ = [
     "OverrideEntry",
     "OverridesTreeResult",
     "OverridesResult",
+    "DefinitionInfo",
 ]
