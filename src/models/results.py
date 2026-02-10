@@ -105,6 +105,10 @@ class MemberRef:
     access_chain: Optional[str] = None  # "$this->orderRepository" or None
     # R4: FQN of the intermediate property in the access chain
     access_chain_symbol: Optional[str] = None  # "App\\Foo::$orderRepository" or None
+    # v4 ISSUE-B: Variable identity for Value receivers
+    on_kind: Optional[str] = None  # "local" or "param" for Value receivers
+    on_file: Optional[str] = None  # File where Value is defined
+    on_line: Optional[int] = None  # Line where Value is defined (0-indexed)
 
 
 @dataclass

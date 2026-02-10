@@ -1256,6 +1256,16 @@ class ContextQuery(Query[ContextResult]):
                 recv_node = self.index.nodes.get(recv_id)
                 if recv_node:
                     step["on"] = recv_node.fqn
+                    # Add variable identity info for Value receivers
+                    if recv_node.kind == "Value" and recv_node.value_kind:
+                        if recv_node.value_kind == "local":
+                            step["on_kind"] = "local"
+                        elif recv_node.value_kind == "parameter":
+                            step["on_kind"] = "param"
+                        if recv_node.file:
+                            step["on_file"] = recv_node.file
+                        if recv_node.range and recv_node.range.get("start_line") is not None:
+                            step["on_line"] = recv_node.range["start_line"]
 
             return [step]
 
@@ -1436,6 +1446,20 @@ class ContextQuery(Query[ContextResult]):
             arguments = self._get_argument_info(child_id)
             call_line = child.range.get("start_line") if child.range else None
 
+            # Resolve receiver variable identity for on: display
+            on_kind = None
+            on_file = None
+            on_line = None
+            recv_id = self.index.get_receiver(child_id)
+            if recv_id:
+                recv_node = self.index.nodes.get(recv_id)
+                if recv_node and recv_node.kind == "Value" and recv_node.value_kind in ("local", "parameter"):
+                    on_kind = "local" if recv_node.value_kind == "local" else "param"
+                    if recv_node.file:
+                        on_file = recv_node.file
+                    if recv_node.range and recv_node.range.get("start_line") is not None:
+                        on_line = recv_node.range["start_line"]
+
             member_ref = MemberRef(
                 target_name="",
                 target_fqn=target_node.fqn,
@@ -1445,6 +1469,9 @@ class ContextQuery(Query[ContextResult]):
                 reference_type=reference_type,
                 access_chain=access_chain,
                 access_chain_symbol=access_chain_symbol,
+                on_kind=on_kind,
+                on_file=on_file,
+                on_line=on_line,
             )
 
             # Check if this call's result is assigned to a local variable
@@ -1791,14 +1818,15 @@ class ContextQuery(Query[ContextResult]):
                         implementations=[],
                     )
 
-                    # Recurse into implementation's dependencies with FRESH visited set
+                    # Recurse into implementation's execution flow with FRESH cycle guard
                     # so we show the full tree even if nodes appeared elsewhere
                     if depth < max_depth:
-                        impl_visited = {impl_id}
+                        impl_cycle_guard = {impl_id}
                         impl_count = [0]
-                        entry.children = self._build_deps_subtree(
-                            impl_id, depth + 1, max_depth, limit, impl_visited, impl_count,
-                            include_impl=True, shown_impl_for=shown_impl_for
+                        entry.children = self._build_execution_flow(
+                            impl_id, depth + 1, max_depth, limit,
+                            impl_cycle_guard, impl_count,
+                            include_impl=True, shown_impl_for=shown_impl_for,
                         )
 
                     implementations.append(entry)
@@ -1840,13 +1868,14 @@ class ContextQuery(Query[ContextResult]):
                         implementations=[],
                     )
 
-                    # Recurse into method's dependencies with FRESH visited set
+                    # Recurse into method's execution flow with FRESH cycle guard
                     if depth < max_depth:
-                        impl_visited = {override_id}
+                        impl_cycle_guard = {override_id}
                         impl_count = [0]
-                        entry.children = self._build_deps_subtree(
-                            override_id, depth + 1, max_depth, limit, impl_visited, impl_count,
-                            include_impl=True, shown_impl_for=shown_impl_for
+                        entry.children = self._build_execution_flow(
+                            override_id, depth + 1, max_depth, limit,
+                            impl_cycle_guard, impl_count,
+                            include_impl=True, shown_impl_for=shown_impl_for,
                         )
 
                     implementations.append(entry)

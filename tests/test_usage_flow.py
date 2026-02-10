@@ -2431,3 +2431,389 @@ class TestIssueA_ConstructorPromotionResolution:
         assert pos_to_name[3] == "$quantity"
         assert pos_to_name[4] == "$status"
         assert pos_to_name[5] == "$createdAt"
+
+
+class TestV4IssueA_ImplExecutionFlow:
+    """Tests for v4 ISSUE-A: Impl subtrees use execution flow instead of raw deps.
+
+    Validates that -> impl blocks show behavioral content (calls, property accesses
+    with receiver chains) instead of structural type noise (parameter_type, type_hint chains).
+    """
+
+    def test_preprocess_impl_shows_behavioral_content(self, index):
+        """v4-A-CLI-01: preProcess impl shows Order::$status property_access with on: receiver.
+
+        NOT structural Order [parameter_type] with entity property declarations.
+        """
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=5, include_impl=True)
+
+        # Find $processedOrder variable entry which contains process() as source_call
+        # The execution flow children of process() are attached to the variable entry
+        proc_var = find_variable_entry(result.uses, "$processedOrder")
+        assert proc_var is not None, "$processedOrder variable entry should be in uses"
+
+        # Find preProcess in variable entry's children (process()'s execution flow)
+        pre_process_call = None
+        for child in proc_var.children:
+            if "preProcess" in child.fqn:
+                pre_process_call = child
+                break
+        assert pre_process_call is not None, "preProcess() should be in $processedOrder children"
+
+        # preProcess should have implementations
+        assert len(pre_process_call.implementations) > 0, "preProcess() should have implementations"
+        impl = pre_process_call.implementations[0]
+        assert "StandardOrderProcessor::preProcess" in impl.fqn
+
+        # Impl children should be behavioral (property_access with on: receiver)
+        assert len(impl.children) > 0, "preProcess impl should have children"
+
+        # Find Order::$status property_access
+        status_entry = None
+        for child in impl.children:
+            if child.member_ref and "Order::$status" in child.member_ref.target_fqn:
+                status_entry = child
+                break
+        assert status_entry is not None, "preProcess impl should have Order::$status property_access"
+        assert status_entry.member_ref.reference_type == "property_access"
+
+        # Should NOT have parameter_type entries
+        param_type_entries = [
+            c for c in impl.children
+            if c.member_ref and c.member_ref.reference_type == "parameter_type"
+        ]
+        assert len(param_type_entries) == 0, "preProcess impl should NOT have parameter_type entries"
+
+    def test_emailsender_impl_no_type_hint_chain(self, index):
+        """v4-A-CLI-02/05: EmailSender::send() impl shows only $sentEmails static_property.
+
+        No recursive type_hint -> EmailSenderInterface -> impl -> type_hint chain.
+        """
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=5, include_impl=True)
+
+        # Find send() call
+        send_call = find_call_entry(result.uses, "send()")
+        assert send_call is not None, "send() call should be in uses"
+
+        # send() should have implementations
+        assert len(send_call.implementations) > 0, "send() should have implementations"
+        send_impl = send_call.implementations[0]
+        assert "EmailSender::send" in send_impl.fqn
+
+        # Impl should have EmailSender::$sentEmails as static_property
+        sent_emails_entries = [
+            c for c in send_impl.children
+            if c.member_ref and "$sentEmails" in c.member_ref.target_fqn
+        ]
+        assert len(sent_emails_entries) > 0, "send() impl should have $sentEmails entry"
+        assert sent_emails_entries[0].member_ref.reference_type == "static_property"
+
+        # Should NOT have type_hint entries (no recursive chain)
+        type_hint_entries = [
+            c for c in send_impl.children
+            if c.member_ref and c.member_ref.reference_type == "type_hint"
+        ]
+        assert len(type_hint_entries) == 0, (
+            "send() impl should NOT have type_hint entries (no recursive chain)"
+        )
+
+    def test_impl_blocks_no_parameter_type_or_return_type(self, index):
+        """v4-A-CLI-03: No parameter_type or return_type entries in any impl block.
+
+        Consistent with v3 ISSUE-B filtering in the main tree.
+        """
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=5, include_impl=True)
+
+        def collect_all_impls(entries):
+            """Recursively collect all implementation entries."""
+            impls = []
+            for entry in entries:
+                impls.extend(entry.implementations)
+                impls.extend(collect_all_impls(entry.children))
+                if entry.source_call:
+                    impls.extend(entry.source_call.implementations)
+                    impls.extend(collect_all_impls(entry.source_call.children))
+            return impls
+
+        all_impls = collect_all_impls(result.uses)
+        assert len(all_impls) > 0, "Should have at least one impl block"
+
+        for impl in all_impls:
+            for child in impl.children:
+                if child.member_ref:
+                    assert child.member_ref.reference_type not in ("parameter_type", "return_type"), (
+                        f"Impl {impl.fqn} should NOT have {child.member_ref.reference_type} entry: "
+                        f"{child.member_ref.target_fqn}"
+                    )
+
+    def test_inventorychecker_impl_empty(self, index):
+        """v4-A-CLI-07: InventoryChecker::checkAvailability() impl has no children.
+
+        Empty body method (just returns true) should show impl line only.
+        """
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=5, include_impl=True)
+
+        # Find checkAvailability() call
+        check_call = find_call_entry(result.uses, "checkAvailability()")
+        assert check_call is not None
+
+        # Should have implementations
+        assert len(check_call.implementations) > 0
+        inv_impl = check_call.implementations[0]
+        assert "InventoryChecker::checkAvailability" in inv_impl.fqn
+
+        # Should have no children (empty body)
+        assert len(inv_impl.children) == 0, (
+            f"InventoryChecker::checkAvailability() impl should be empty, "
+            f"got {len(inv_impl.children)} children"
+        )
+
+    def test_depth_budget_respected_in_impl(self, index):
+        """v4-A-CLI-09: Depth budget limits impl subtree expansion."""
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        # Use depth=2 which should limit how deep impl blocks go
+        result = query.execute(node.id, depth=2, include_impl=True)
+
+        def max_depth_in_entries(entries, current=0):
+            """Find the maximum depth across all entries recursively."""
+            if not entries:
+                return current
+            depths = [current]
+            for entry in entries:
+                depths.append(max_depth_in_entries(entry.children, current + 1))
+                for impl in entry.implementations:
+                    depths.append(max_depth_in_entries(impl.children, current + 1))
+                if entry.source_call:
+                    depths.append(max_depth_in_entries(
+                        entry.source_call.children, current + 1
+                    ))
+                    for impl in entry.source_call.implementations:
+                        depths.append(max_depth_in_entries(impl.children, current + 1))
+            return max(depths)
+
+        max_d = max_depth_in_entries(result.uses)
+        # With depth=2, entries at depth 1 and 2 are shown, plus impl children
+        # at depth 2+1=3 maximum. The actual limit depends on where impls attach.
+        # The key test: depth should not be unbounded
+        assert max_d <= 5, f"Depth should be bounded, got max depth {max_d}"
+
+    def test_json_impl_has_execution_flow_structure(self, index):
+        """v4-A-CLI-10: JSON implementations array has execution flow entries.
+
+        Entries should have member_ref, entry_type, etc. -- NOT raw dep edges.
+        """
+        from src.output.tree import context_tree_to_dict
+
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=5, include_impl=True)
+
+        json_dict = context_tree_to_dict(result)
+
+        def find_impls_in_json(entries):
+            """Recursively find all implementation arrays in JSON."""
+            impls = []
+            for entry in entries:
+                if "implementations" in entry:
+                    impls.extend(entry["implementations"])
+                if entry.get("children"):
+                    impls.extend(find_impls_in_json(entry["children"]))
+                if entry.get("source_call"):
+                    sc = entry["source_call"]
+                    if "implementations" in sc:
+                        impls.extend(sc["implementations"])
+                    if sc.get("children"):
+                        impls.extend(find_impls_in_json(sc["children"]))
+            return impls
+
+        all_json_impls = find_impls_in_json(json_dict["uses"])
+        assert len(all_json_impls) > 0, "Should have impl entries in JSON"
+
+        # Find send() impl which has children
+        send_impl = None
+        for impl in all_json_impls:
+            if "EmailSender::send" in impl.get("fqn", ""):
+                send_impl = impl
+                break
+        assert send_impl is not None
+
+        # Its children should have execution flow structure (member_ref)
+        assert len(send_impl["children"]) > 0
+        child = send_impl["children"][0]
+        assert "member_ref" in child, "Impl child should have member_ref (execution flow)"
+        assert child["member_ref"]["reference_type"] == "static_property"
+
+
+class TestV4IssueB_LocalVariableIdentity:
+    """Tests for v4 ISSUE-B: Local variable identity in receiver chains.
+
+    Validates that on: lines show [local]/[param] tags with (file:line)
+    for Value receivers, and NO tags for property chain receivers.
+    """
+
+    def test_local_variable_on_shows_local_tag(self, index):
+        """v4-B-CLI-01: Local variable on: shows [local] tag and (file:line).
+
+        $savedOrder is a local variable assigned at line 45 (0-based).
+        Source chain on: should show [local] and file:line.
+        """
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        # Find an argument that traces to $savedOrder (e.g., OrderOutput::$id)
+        output_call = find_call_entry(result.uses, "OrderOutput::__construct()")
+        assert output_call is not None, "OrderOutput::__construct() should be in uses"
+
+        # Find an arg with source chain that has on: with savedOrder
+        found_local = False
+        for arg in output_call.arguments:
+            if arg.source_chain:
+                for step in arg.source_chain:
+                    if step.get("on") and "savedOrder" in step["on"]:
+                        assert step.get("on_kind") == "local", (
+                            f"$savedOrder should have on_kind='local', got {step.get('on_kind')}"
+                        )
+                        assert step.get("on_file") is not None, "$savedOrder should have on_file"
+                        assert step.get("on_line") is not None, "$savedOrder should have on_line"
+                        assert "OrderService" in step["on_file"]
+                        found_local = True
+                        break
+            if found_local:
+                break
+        assert found_local, "Should find $savedOrder with [local] tag in source chain"
+
+    def test_parameter_on_shows_param_tag(self, index):
+        """v4-B-CLI-02: Parameter on: shows [param] tag and (file:line).
+
+        $input is a parameter of createOrder().
+        Source chain on: should show [param] and file:line.
+        """
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        # Find checkAvailability() which has args tracing to $input
+        check_call = find_call_entry(result.uses, "checkAvailability()")
+        assert check_call is not None
+
+        found_param = False
+        for arg in check_call.arguments:
+            if arg.source_chain:
+                for step in arg.source_chain:
+                    if step.get("on") and "$input" in step["on"]:
+                        assert step.get("on_kind") == "param", (
+                            f"$input should have on_kind='param', got {step.get('on_kind')}"
+                        )
+                        assert step.get("on_file") is not None, "$input should have on_file"
+                        assert step.get("on_line") is not None, "$input should have on_line"
+                        found_param = True
+                        break
+            if found_param:
+                break
+        assert found_param, "Should find $input with [param] tag in source chain"
+
+    def test_this_property_no_kind_tag(self, index):
+        """v4-B-CLI-05: $this->property receivers have NO kind tag.
+
+        Property chains use access_chain from MemberRef, which should NOT
+        have on_kind set for property receivers.
+        """
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        # Find send() call which has on: $this->emailSender
+        send_call = find_call_entry(result.uses, "send()")
+        assert send_call is not None
+        assert send_call.member_ref is not None
+        assert send_call.member_ref.access_chain is not None
+        assert "$this->" in send_call.member_ref.access_chain
+
+        # Property chain should NOT have on_kind
+        assert send_call.member_ref.on_kind is None, (
+            f"$this->property should NOT have on_kind, got {send_call.member_ref.on_kind}"
+        )
+
+    def test_json_includes_on_kind_in_source_chain(self, index):
+        """v4-B-CLI-03: JSON output includes on_kind, on_file, on_line for Value receivers."""
+        from src.output.tree import context_tree_to_dict
+
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        json_dict = context_tree_to_dict(result)
+
+        # Search for on_kind in source chain steps
+        found_on_kind = False
+        for entry in json_dict["uses"]:
+            args = entry.get("arguments", [])
+            if not args and entry.get("source_call"):
+                args = entry["source_call"].get("arguments", [])
+            for arg in args:
+                if arg.get("source_chain"):
+                    for step in arg["source_chain"]:
+                        if step.get("on_kind"):
+                            found_on_kind = True
+                            assert step["on_kind"] in ("local", "param")
+                            assert "on_file" in step
+                            assert "on_line" in step
+                            break
+                if found_on_kind:
+                    break
+            if found_on_kind:
+                break
+        assert found_on_kind, "JSON source chain should include on_kind for Value receivers"
+
+    def test_json_member_ref_includes_on_kind(self, index):
+        """v4-B-CLI-03: JSON member_ref includes on_kind for entries with Value receivers."""
+        from src.output.tree import context_tree_to_dict
+
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=5, include_impl=True)
+
+        json_dict = context_tree_to_dict(result)
+
+        def find_member_ref_with_on_kind(entries):
+            for entry in entries:
+                mr = entry.get("member_ref", {})
+                if mr.get("on_kind"):
+                    return mr
+                if entry.get("children"):
+                    found = find_member_ref_with_on_kind(entry["children"])
+                    if found:
+                        return found
+                if entry.get("source_call"):
+                    sc = entry["source_call"]
+                    if sc.get("children"):
+                        found = find_member_ref_with_on_kind(sc["children"])
+                        if found:
+                            return found
+                    if "implementations" in sc:
+                        for impl in sc["implementations"]:
+                            found = find_member_ref_with_on_kind(impl.get("children", []))
+                            if found:
+                                return found
+                if "implementations" in entry:
+                    for impl in entry["implementations"]:
+                        found = find_member_ref_with_on_kind(impl.get("children", []))
+                        if found:
+                            return found
+            return None
+
+        mr = find_member_ref_with_on_kind(json_dict["uses"])
+        assert mr is not None, "Should find member_ref with on_kind in JSON"
+        assert mr["on_kind"] in ("local", "param")
+        assert "on_file" in mr
+        assert "on_line" in mr

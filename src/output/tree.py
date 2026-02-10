@@ -171,7 +171,12 @@ def _format_argument_lines(arg, indent: str = "          ") -> str:
             step_ref = f" [cyan]\\[{step['reference_type']}][/cyan]" if step.get("reference_type") else ""
             line += f"\n{indent}    [dim]source:[/dim] {step_fqn}{step_ref}"
             if step.get("on"):
-                line += f"\n{indent}        [dim]on:[/dim] [green]{step['on']}[/green]"
+                on_text = step["on"]
+                if step.get("on_kind"):
+                    on_text += f" [cyan]\\[{step['on_kind']}][/cyan]"
+                if step.get("on_file") and step.get("on_line") is not None:
+                    on_text += f" [dim]({step['on_file']}:{step['on_line'] + 1})[/dim]"
+                line += f"\n{indent}        [dim]on:[/dim] [green]{on_text}[/green]"
 
     return line
 
@@ -315,6 +320,10 @@ def print_context_tree(result: ContextResult, console: Console):
                         chain_text = sc.member_ref.access_chain
                         if sc.member_ref.access_chain_symbol:
                             chain_text += f" ({sc.member_ref.access_chain_symbol})"
+                        if sc.member_ref.on_kind:
+                            chain_text += f" [cyan]\\[{sc.member_ref.on_kind}][/cyan]"
+                        if sc.member_ref.on_file and sc.member_ref.on_line is not None:
+                            chain_text += f" [dim]({sc.member_ref.on_file}:{sc.member_ref.on_line + 1})[/dim]"
                         label += f"\n          [dim]on:[/dim] [green]{chain_text}[/green]"
                     if sc.arguments:
                         label += "\n          [dim]args:[/dim]"
@@ -342,6 +351,10 @@ def print_context_tree(result: ContextResult, console: Console):
                     # R4: Include property FQN in parentheses after access chain if available
                     if entry.member_ref.access_chain_symbol:
                         chain_text += f" ({entry.member_ref.access_chain_symbol})"
+                    if entry.member_ref.on_kind:
+                        chain_text += f" [cyan]\\[{entry.member_ref.on_kind}][/cyan]"
+                    if entry.member_ref.on_file and entry.member_ref.on_line is not None:
+                        chain_text += f" [dim]({entry.member_ref.on_file}:{entry.member_ref.on_line + 1})[/dim]"
                     label += f"\n        [dim]on:[/dim] [green]{chain_text}[/green]"
                 # Show argument-to-parameter mappings if present
                 if entry.arguments:
@@ -461,6 +474,13 @@ def context_tree_to_dict(result: ContextResult) -> dict:
             # R4: Include access_chain_symbol if present (property FQN)
             if entry.member_ref.access_chain_symbol:
                 member_ref_dict["access_chain_symbol"] = entry.member_ref.access_chain_symbol
+            # v4 ISSUE-B: Include variable identity for Value receivers
+            if entry.member_ref.on_kind:
+                member_ref_dict["on_kind"] = entry.member_ref.on_kind
+            if entry.member_ref.on_file:
+                member_ref_dict["on_file"] = entry.member_ref.on_file
+            if entry.member_ref.on_line is not None:
+                member_ref_dict["on_line"] = entry.member_ref.on_line + 1
             d["member_ref"] = member_ref_dict
         # Include arguments if present
         if entry.arguments:
