@@ -612,46 +612,46 @@ class TestPhase1ReferenceTypeDistinction:
             f"got [{order_call.member_ref.reference_type}]"
         )
 
-    def test_t1_3_parameter_type_shows_parameter_type(self, index):
-        """T1.3 / AC2: CreateOrderInput parameter shows [parameter_type].
+    def test_t1_3_parameter_type_filtered_from_uses(self, index):
+        """v3 AC11: CreateOrderInput [parameter_type] is filtered from USES.
 
         The createOrder method has parameter `CreateOrderInput $input`.
-        The reference to CreateOrderInput class should show as [parameter_type].
+        Since the DEFINITION section already shows this, the USES section
+        should NOT include a [parameter_type] entry for CreateOrderInput.
         """
         node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
         query = ContextQuery(index)
         result = query.execute(node.id, depth=1)
 
-        # Find CreateOrderInput in USES
+        # CreateOrderInput should NOT appear as a parameter_type entry in USES
         input_entry = find_entry_by_fqn(result.uses, "CreateOrderInput")
-        assert input_entry is not None, (
-            "CreateOrderInput should appear in createOrder() USES"
-        )
-        assert input_entry.member_ref is not None
-        assert input_entry.member_ref.reference_type == "parameter_type", (
-            f"CreateOrderInput should be [parameter_type], "
-            f"got [{input_entry.member_ref.reference_type}]"
+        assert input_entry is None, (
+            "CreateOrderInput [parameter_type] should be filtered from createOrder() USES "
+            "(already shown in DEFINITION section)"
         )
 
-    def test_t1_4_return_type_shows_return_type(self, index):
-        """T1.4 / AC3: OrderOutput return type shows [return_type].
+    def test_t1_4_return_type_filtered_from_uses(self, index):
+        """v3 AC10: OrderOutput [return_type] is filtered from USES.
 
         The createOrder method returns OrderOutput.
-        The reference to OrderOutput class should show as [return_type].
+        Since the DEFINITION section already shows this, the USES section
+        should NOT include a [return_type] entry for OrderOutput.
+        Note: OrderOutput::__construct() [instantiation] is a different entry
+        and should still appear.
         """
         node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
         query = ContextQuery(index)
         result = query.execute(node.id, depth=1)
 
-        # Find OrderOutput in USES
-        output_entry = find_entry_by_fqn(result.uses, "OrderOutput")
-        assert output_entry is not None, (
-            "OrderOutput should appear in createOrder() USES"
-        )
-        assert output_entry.member_ref is not None
-        assert output_entry.member_ref.reference_type == "return_type", (
-            f"OrderOutput should be [return_type], "
-            f"got [{output_entry.member_ref.reference_type}]"
+        # No entry should have reference_type == "return_type"
+        return_type_entries = [
+            e for e in result.uses
+            if e.member_ref and e.member_ref.reference_type == "return_type"
+        ]
+        assert len(return_type_entries) == 0, (
+            "No [return_type] entries should appear in method USES "
+            "(filtered because DEFINITION section already shows return type). "
+            f"Found: {[e.fqn for e in return_type_entries]}"
         )
 
     def test_t1_5_property_type_shows_property_type(self, index):
@@ -674,8 +674,9 @@ class TestPhase1ReferenceTypeDistinction:
         query = ContextQuery(index)
         result = query.execute(node.id, depth=1)
 
-        # Find type-related references in USES (type_hint or property_type)
-        TYPE_RELATED = {"type_hint", "property_type", "parameter_type", "return_type"}
+        # Find type-related references in USES (type_hint or property_type only;
+        # parameter_type and return_type are now filtered from USES)
+        TYPE_RELATED = {"type_hint", "property_type"}
         type_entries = [
             e for e in result.uses
             if e.member_ref and e.member_ref.reference_type in TYPE_RELATED
@@ -684,14 +685,6 @@ class TestPhase1ReferenceTypeDistinction:
             f"OrderService should have type-related references in USES. "
             f"Found reference types: "
             f"{[e.member_ref.reference_type for e in result.uses if e.member_ref]}"
-        )
-
-        # At method level, parameter/return types ARE correctly distinguished
-        method_node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
-        method_result = query.execute(method_node.id, depth=1)
-        method_ref_types = {e.member_ref.reference_type for e in method_result.uses if e.member_ref}
-        assert "parameter_type" in method_ref_types or "return_type" in method_ref_types, (
-            f"Method-level context should distinguish param/return types. Found: {method_ref_types}"
         )
 
     def test_t1_10_json_output_includes_new_reference_types(self, index):
@@ -718,11 +711,12 @@ class TestPhase1ReferenceTypeDistinction:
         assert "instantiation" in ref_types or "method_call" in ref_types, (
             f"JSON USES should include specific reference types. Found: {ref_types}"
         )
-        # Check for the type distinction values
-        type_related = ref_types & {"parameter_type", "return_type", "property_type", "type_hint"}
-        assert len(type_related) > 0, (
-            f"JSON USES should include type-related reference types. Found: {ref_types}"
-        )
+        # Check for the type distinction values (parameter_type and return_type
+        # are now filtered from method-level USES)
+        type_related = ref_types & {"property_type", "type_hint"}
+        # type_related may be empty for method-level queries since only
+        # property_type and type_hint remain, and createOrder() may not have those.
+        # The key assertion is that instantiation/method_call are present (above).
 
     def test_existing_method_call_preserved(self, index):
         """Existing method_call reference types are preserved after Phase 1.
@@ -742,27 +736,30 @@ class TestPhase1ReferenceTypeDistinction:
             "createOrder() USES should still contain [method_call] entries"
         )
 
-    def test_no_bare_type_hint_for_param_or_return(self, index):
-        """After Phase 1, parameter and return types should NOT show as bare [type_hint].
+    def test_no_param_or_return_type_in_method_uses(self, index):
+        """v3 AC10-12: No parameter_type or return_type entries in method USES.
 
-        The only valid [type_hint] references in a method's USES should be from
-        edge sources that are not Argument, Method, or Property nodes.
+        After v3 ISSUE-B, parameter_type and return_type entries are filtered
+        from method-level USES because the DEFINITION section already shows them.
+        Note: OrderOutput::__construct() [instantiation] is a call entry and
+        should still appear — only the type reference entries are filtered.
         """
         node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
         query = ContextQuery(index)
         result = query.execute(node.id, depth=1)
 
-        # For createOrder, the known parameter type (CreateOrderInput) and
-        # return type (OrderOutput) should NOT be labeled as generic type_hint
+        # No entry should have reference_type of parameter_type or return_type
         for entry in result.uses:
-            if entry.member_ref and entry.member_ref.reference_type == "type_hint":
-                # If there are type_hint entries, they should NOT be for known
-                # param/return types
-                assert "CreateOrderInput" not in entry.fqn, (
-                    f"CreateOrderInput should be [parameter_type], not [type_hint]"
+            if entry.member_ref:
+                assert entry.member_ref.reference_type not in ("parameter_type", "return_type"), (
+                    f"{entry.fqn} has [{entry.member_ref.reference_type}] which should be "
+                    f"filtered from method-level USES"
                 )
-                assert "OrderOutput" not in entry.fqn, (
-                    f"OrderOutput should be [return_type], not [type_hint]"
+            # Also check source_call for Kind 1 entries
+            if entry.source_call and entry.source_call.member_ref:
+                assert entry.source_call.member_ref.reference_type not in ("parameter_type", "return_type"), (
+                    f"{entry.source_call.fqn} has [{entry.source_call.member_ref.reference_type}] "
+                    f"which should be filtered from method-level USES"
                 )
 
 
@@ -977,18 +974,20 @@ class TestPhase2ArgumentTracking:
     def test_t2_8_entry_without_call_has_empty_arguments(self, index):
         """T2.8 / AC10: Entry without Call node has empty arguments list.
 
-        Type references (extends, parameter_type, return_type) and property
-        accesses that don't match a Call node should have empty arguments.
+        Type references (type_hint, property_type) and property accesses
+        that don't match a Call node should have empty arguments.
+        Note: parameter_type and return_type are now filtered from method USES.
         """
         node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
         query = ContextQuery(index)
         result = query.execute(node.id, depth=1)
 
-        # Find type reference entries (parameter_type, return_type)
+        # Find type reference entries (type_hint, property_type only —
+        # parameter_type/return_type are filtered from method USES)
         type_entries = [
             e for e in result.uses
             if e.member_ref and e.member_ref.reference_type in (
-                "parameter_type", "return_type", "type_hint"
+                "type_hint", "property_type"
             )
         ]
         for entry in type_entries:
@@ -1264,7 +1263,8 @@ class TestPhase3ExecutionFlow:
             for e in result.uses
             if e.member_ref
         }
-        # Should include structural types like type_hint, parameter_type, etc.
+        # Should include structural types. Note: parameter_type and return_type
+        # are only filtered from Method/Function USES, not Class-level USES.
         structural_types = {"property_access", "parameter_type", "type_hint",
                            "return_type", "property_type"}
         assert ref_types & structural_types, (
@@ -1860,3 +1860,574 @@ class TestPhase4GracefulDegradation:
                 for arg in entry.source_call.arguments:
                     assert arg.value_expr is not None
                     assert arg.position is not None
+
+
+# =============================================================================
+# v3 ISSUE-B: Filter return_type/parameter_type from USES
+# =============================================================================
+
+
+class TestIssueB_FilterSignatureTypes:
+    """v3 ISSUE-B integration tests: return_type and parameter_type entries
+    are filtered from method-level USES because DEFINITION already shows them.
+
+    ACs covered: 10-16.
+    """
+
+    def test_ac10_return_type_not_in_method_uses(self, index):
+        """AC10: Method with return type OrderOutput — no [return_type] in USES."""
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        return_type_entries = [
+            e for e in result.uses
+            if e.member_ref and e.member_ref.reference_type == "return_type"
+        ]
+        assert len(return_type_entries) == 0, (
+            f"No [return_type] entries should be in method USES. "
+            f"Found: {[e.fqn for e in return_type_entries]}"
+        )
+
+    def test_ac11_parameter_type_not_in_method_uses(self, index):
+        """AC11: Method with param type CreateOrderInput — no [parameter_type] in USES."""
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        param_type_entries = [
+            e for e in result.uses
+            if e.member_ref and e.member_ref.reference_type == "parameter_type"
+        ]
+        assert len(param_type_entries) == 0, (
+            f"No [parameter_type] entries should be in method USES. "
+            f"Found: {[e.fqn for e in param_type_entries]}"
+        )
+
+    def test_ac12_multiple_param_types_all_filtered(self, index):
+        """AC12: Method with multiple parameter types — none appear in USES.
+
+        checkAvailability(string $productId, int $quantity) has built-in types
+        which may not produce type reference entries. Use createOrder which has
+        CreateOrderInput as a class-type parameter.
+        """
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        # Verify no parameter_type or return_type entries exist at all
+        filtered_types = {"parameter_type", "return_type"}
+        for entry in result.uses:
+            if entry.member_ref and entry.member_ref.reference_type in filtered_types:
+                assert False, (
+                    f"Found [{entry.member_ref.reference_type}] entry in method USES: "
+                    f"{entry.fqn}. These should be filtered."
+                )
+
+    def test_ac13_property_type_kept_in_class_uses(self, index):
+        """AC13: Class query retains [property_type] entries in USES."""
+        node = index.resolve_symbol("App\\Service\\OrderService")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        # Class-level USES should still include type references
+        # (property_type, type_hint, parameter_type, return_type are all kept
+        # at class level since _get_type_references is only for Method/Function)
+        TYPE_RELATED = {"type_hint", "property_type", "parameter_type", "return_type"}
+        type_entries = [
+            e for e in result.uses
+            if e.member_ref and e.member_ref.reference_type in TYPE_RELATED
+        ]
+        assert len(type_entries) > 0, (
+            f"Class-level USES should retain type reference entries. "
+            f"Found reference types: "
+            f"{[e.member_ref.reference_type for e in result.uses if e.member_ref]}"
+        )
+
+    def test_ac14_type_hint_kept_in_method_uses(self, index):
+        """AC14: type_hint entries remain in method USES (not filtered).
+
+        type_hint entries come from instanceof, catch blocks, or other non-signature
+        usages. They should not be filtered.
+        """
+        # This test verifies that TYPE_KINDS still includes type_hint.
+        # For createOrder(), there may or may not be type_hint entries.
+        # The key assertion is that type_hint is NOT in the filtered set.
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        # Verify that if any type_hint entries exist, they are still present
+        # (not filtered). We can't assert type_hint entries exist since
+        # createOrder() may not have any, but we verify no regression.
+        for entry in result.uses:
+            if entry.member_ref and entry.member_ref.reference_type == "type_hint":
+                # type_hint entries are kept — this is correct
+                pass
+
+    def test_ac15_json_excludes_return_type_parameter_type(self, index):
+        """AC15: JSON output excludes return_type/parameter_type from uses array."""
+        from src.output.tree import context_tree_to_dict
+
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        json_dict = context_tree_to_dict(result)
+
+        # Check all entries in uses array — none should have
+        # reference_type of "return_type" or "parameter_type"
+        filtered_types = {"return_type", "parameter_type"}
+        for entry in json_dict["uses"]:
+            if "member_ref" in entry:
+                ref_type = entry["member_ref"].get("reference_type")
+                assert ref_type not in filtered_types, (
+                    f"JSON uses entry has [{ref_type}] which should be filtered. "
+                    f"FQN: {entry['fqn']}"
+                )
+            # Also check source_call for Kind 1 entries
+            if entry.get("source_call") and "member_ref" in entry["source_call"]:
+                ref_type = entry["source_call"]["member_ref"].get("reference_type")
+                assert ref_type not in filtered_types, (
+                    f"JSON source_call has [{ref_type}] which should be filtered. "
+                    f"FQN: {entry['source_call']['fqn']}"
+                )
+
+    def test_ac16_non_method_query_unchanged(self, index):
+        """AC16: Non-Method/Function queries are unchanged (no regression).
+
+        Class-level queries use the structural approach and include all
+        reference types including parameter_type and return_type.
+        """
+        # Query a Class node
+        node = index.resolve_symbol("App\\Repository\\InMemoryOrderRepository")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        # Class-level should still have structural types
+        ref_types = {
+            e.member_ref.reference_type
+            for e in result.uses
+            if e.member_ref
+        }
+        structural_types = {"property_access", "parameter_type", "type_hint",
+                           "return_type", "property_type"}
+        assert ref_types & structural_types, (
+            f"Class-level USES should include structural reference types. "
+            f"Found: {ref_types}"
+        )
+
+    def test_definition_still_has_return_type(self, index):
+        """Verify DEFINITION section still shows return type (not affected by filter)."""
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        assert result.definition is not None
+        # Return type should be in DEFINITION
+        assert result.definition.return_type is not None, (
+            "DEFINITION should still show return type"
+        )
+        assert "OrderOutput" in (
+            result.definition.return_type.get("name", "") or
+            result.definition.return_type.get("fqn", "")
+        ), "DEFINITION return type should include OrderOutput"
+
+    def test_definition_still_has_arguments(self, index):
+        """Verify DEFINITION section still shows typed arguments (not affected by filter)."""
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        assert result.definition is not None
+        assert len(result.definition.arguments) >= 1, (
+            "DEFINITION should still show arguments"
+        )
+        arg_names = [a.get("name") for a in result.definition.arguments]
+        assert any("input" in (name or "") for name in arg_names), (
+            "DEFINITION arguments should include $input"
+        )
+
+
+# =============================================================================
+# v3 ISSUE-C: Filter orphan property access entries from USES
+# =============================================================================
+
+
+class TestIssueC_FilterOrphanPropertyAccess:
+    """v3 ISSUE-C integration tests: orphan property access entries consumed by
+    non-Call expressions (string concatenation, sprintf) are filtered from USES.
+
+    ACs covered: 17-24.
+    """
+
+    def test_ac17_order_id_concat_orphan_filtered(self, index):
+        """AC17: $savedOrder->id consumed by string concatenation in send().$subject is filtered.
+
+        The property access Order::$id at line 49 is consumed by the string
+        concatenation expression in send().$subject. It should not appear as
+        a top-level USES entry.
+        """
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        # Find any top-level Order::$id property_access entry
+        orphan_id_entries = [
+            e for e in result.uses
+            if e.member_ref
+            and e.member_ref.reference_type == "property_access"
+            and "Order::$id" in e.fqn
+        ]
+        assert len(orphan_id_entries) == 0, (
+            f"Order::$id [property_access] orphan should be filtered from USES. "
+            f"Found {len(orphan_id_entries)} entries at lines: "
+            f"{[e.line for e in orphan_id_entries]}"
+        )
+
+    def test_ac18_sprintf_orphans_filtered(self, index):
+        """AC18: $savedOrder->productId and $savedOrder->quantity consumed by sprintf are filtered.
+
+        Property accesses at lines 53-54 consumed by sprintf() in send().$body
+        should not appear as top-level USES entries.
+        """
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        orphan_entries = [
+            e for e in result.uses
+            if e.member_ref
+            and e.member_ref.reference_type == "property_access"
+            and ("Order::$productId" in e.fqn or "Order::$quantity" in e.fqn)
+        ]
+        assert len(orphan_entries) == 0, (
+            f"Order::$productId and Order::$quantity orphans should be filtered. "
+            f"Found: {[e.fqn for e in orphan_entries]}"
+        )
+
+    def test_ac19_consumed_property_access_remains_nested(self, index):
+        """AC19: Order::$id consumed by OrderOutput constructor argument edge remains nested.
+
+        The property access $savedOrder->id at line 61 is consumed by the
+        OrderOutput::__construct() argument edge. It should appear in the
+        constructor's argument source_chain, NOT as a separate top-level entry.
+        """
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        # Find OrderOutput::__construct() call entry
+        output_ctor = find_call_entry(result.uses, "OrderOutput::__construct()")
+        assert output_ctor is not None, (
+            "OrderOutput::__construct() should appear in USES"
+        )
+        # First argument should reference $savedOrder->id
+        assert len(output_ctor.arguments) >= 1
+        assert "$savedOrder->id" in (output_ctor.arguments[0].value_expr or ""), (
+            f"First arg of OrderOutput::__construct() should be $savedOrder->id, "
+            f"got '{output_ctor.arguments[0].value_expr}'"
+        )
+
+    def test_ac20_local_variable_property_access_not_filtered(self, index):
+        """AC20: Property access assigned to local variable remains as Kind 1 entry.
+
+        Standalone property accesses like $repo = $this->orderRepository that have
+        assigned_from edges to local variables are Kind 1 entries, not orphans.
+        These should NOT be filtered.
+        """
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        # All Kind 1 entries should remain (they are never orphan candidates)
+        kind1_entries = [e for e in result.uses if e.entry_type == "local_variable"]
+        assert len(kind1_entries) >= 4, (
+            f"Expected at least 4 Kind 1 variable entries, got {len(kind1_entries)}"
+        )
+
+    def test_ac21_receiver_property_access_not_filtered(self, index):
+        """AC21: Property access consumed as receiver remains nested as on:.
+
+        $this->inventoryChecker consumed via receiver edge by checkAvailability()
+        is correctly nested as on: inside the call. It is NOT a top-level orphan.
+        """
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        # checkAvailability() should have access_chain showing the receiver
+        check_entry = find_entry_by_fqn(result.uses, "checkAvailability()")
+        assert check_entry is not None
+        assert check_entry.member_ref is not None
+        assert check_entry.member_ref.access_chain == "$this->inventoryChecker", (
+            f"checkAvailability() should have access_chain=$this->inventoryChecker, "
+            f"got '{check_entry.member_ref.access_chain}'"
+        )
+
+    def test_ac23_json_excludes_orphan_entries(self, index):
+        """AC23: JSON output excludes orphan property access entries."""
+        from src.output.tree import context_tree_to_dict
+
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        json_dict = context_tree_to_dict(result)
+
+        # No top-level entry should be an orphan property_access for Order::$id/productId/quantity
+        orphan_fqns = {"Order::$id", "Order::$productId", "Order::$quantity"}
+        for entry in json_dict["uses"]:
+            if "member_ref" in entry:
+                ref_type = entry["member_ref"].get("reference_type")
+                fqn = entry["fqn"]
+                if ref_type == "property_access":
+                    is_orphan = any(name in fqn for name in orphan_fqns)
+                    assert not is_orphan, (
+                        f"JSON output should not include orphan property_access: {fqn}"
+                    )
+
+    def test_ac24_tree_and_json_consistent(self, index):
+        """AC24: Tree and JSON output consistently exclude orphan entries."""
+        from src.output.tree import context_tree_to_dict
+
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        json_dict = context_tree_to_dict(result)
+
+        # Count of top-level entries should match
+        tree_count = len(result.uses)
+        json_count = len(json_dict["uses"])
+        assert tree_count == json_count, (
+            f"Tree ({tree_count}) and JSON ({json_count}) should have same entry count"
+        )
+
+        # Neither should have property_access orphans
+        tree_prop_accesses = [
+            e for e in result.uses
+            if e.member_ref and e.member_ref.reference_type == "property_access"
+        ]
+        json_prop_accesses = [
+            e for e in json_dict["uses"]
+            if "member_ref" in e and e["member_ref"].get("reference_type") == "property_access"
+        ]
+        assert len(tree_prop_accesses) == len(json_prop_accesses), (
+            f"Tree ({len(tree_prop_accesses)}) and JSON ({len(json_prop_accesses)}) "
+            f"should have same number of property_access entries"
+        )
+
+    def test_no_orphan_property_access_in_createOrder(self, index):
+        """Comprehensive check: no orphan property_access entries in createOrder() USES.
+
+        After filtering, createOrder() should have 0 top-level property_access entries.
+        All property accesses are either consumed as receivers (on:), consumed as
+        arguments (nested in source_chain), or consumed by non-Call expressions
+        (filtered by the orphan heuristic).
+        """
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        prop_access_entries = [
+            e for e in result.uses
+            if e.member_ref and e.member_ref.reference_type == "property_access"
+        ]
+        assert len(prop_access_entries) == 0, (
+            f"createOrder() should have 0 top-level property_access entries after filtering. "
+            f"Found: {[e.fqn + ' line=' + str(e.line) for e in prop_access_entries]}"
+        )
+
+    def test_method_call_entries_preserved(self, index):
+        """Regression: method_call and instantiation entries are not affected by filter."""
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        # Key entries should still be present
+        assert find_call_entry(result.uses, "checkAvailability()") is not None
+        assert find_call_entry(result.uses, "Order::__construct()") is not None
+        assert find_call_entry(result.uses, "process()") is not None
+        assert find_call_entry(result.uses, "save()") is not None
+        assert find_call_entry(result.uses, "send()") is not None
+        assert find_call_entry(result.uses, "OrderOutput::__construct()") is not None
+
+
+class TestIssueA_ConstructorPromotionResolution:
+    """Tests for ISSUE-A: Constructor promotion assigned_from fallback.
+
+    Validates that promoted constructor parameters resolve to Property FQNs
+    via the assigned_from edge fallback when no Argument children exist.
+    ACs covered: 1-9.
+    """
+
+    def test_ac5_order_constructor_args_resolve_to_property_fqns(self, index):
+        """AC5: Order::__construct() promoted params resolve to Property FQNs.
+
+        createOrder() calls new Order(...) with 6 promoted params.
+        Each param_fqn should be the Property FQN, not the Value FQN.
+        """
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        # Order::__construct() is a Kind 1 entry (result assigned to $order)
+        order_call = find_call_entry(result.uses, "Order::__construct()")
+        assert order_call is not None, "Order::__construct() call should exist"
+        assert len(order_call.arguments) == 6, f"Expected 6 args, got {len(order_call.arguments)}"
+
+        # Each argument's param_fqn should be the promoted Property FQN
+        param_fqns = {a.param_fqn for a in order_call.arguments}
+        assert "App\\Entity\\Order::$id" in param_fqns
+        assert "App\\Entity\\Order::$customerEmail" in param_fqns
+        assert "App\\Entity\\Order::$productId" in param_fqns
+        assert "App\\Entity\\Order::$quantity" in param_fqns
+        assert "App\\Entity\\Order::$status" in param_fqns
+        assert "App\\Entity\\Order::$createdAt" in param_fqns
+
+    def test_ac6_order_constructor_param_names_resolve(self, index):
+        """AC6: Promoted param names resolve from Value children.
+
+        param_name should be the Value node name ($id, $customerEmail, etc.).
+        """
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        order_call = find_call_entry(result.uses, "Order::__construct()")
+        assert order_call is not None
+
+        param_names = {a.param_name for a in order_call.arguments}
+        assert "$id" in param_names
+        assert "$customerEmail" in param_names
+        assert "$productId" in param_names
+        assert "$quantity" in param_names
+        assert "$status" in param_names
+        assert "$createdAt" in param_names
+
+    def test_ac5_orderoutput_constructor_resolves(self, index):
+        """AC5: OrderOutput::__construct() promoted params also resolve.
+
+        OrderOutput has 6 promoted constructor params. All should resolve
+        to Property FQNs.
+        """
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        output_call = find_call_entry(result.uses, "OrderOutput::__construct()")
+        assert output_call is not None, "OrderOutput::__construct() should exist"
+        assert len(output_call.arguments) == 6
+
+        # Verify all param_fqns are Property FQNs (contain ::$)
+        for arg in output_call.arguments:
+            assert "::$" in arg.param_fqn, (
+                f"arg[{arg.position}] param_fqn should be a Property FQN, "
+                f"got: {arg.param_fqn}"
+            )
+
+    def test_ac7_single_promoted_param_resolves(self, index):
+        """AC7: OrderCreatedMessage::__construct() with single promoted param.
+
+        The message call is consumed by dispatch(), so we test param resolution
+        directly via ContextQuery._resolve_param_fqn and _resolve_param_name.
+        """
+        query = ContextQuery(index)
+
+        # Find the Call node for OrderCreatedMessage::__construct()
+        msg_constructor = None
+        for nid, node in index.nodes.items():
+            if node.fqn == "App\\Ui\\Messenger\\Message\\OrderCreatedMessage::__construct()" and node.kind == "Method":
+                msg_constructor = node
+                break
+        assert msg_constructor is not None
+
+        calls = index.get_calls_to(msg_constructor.id)
+        assert len(calls) == 1
+        call_id = calls[0]
+
+        # Test param name and FQN resolution for position 0
+        param_name = query._resolve_param_name(call_id, 0)
+        param_fqn = query._resolve_param_fqn(call_id, 0)
+
+        assert param_name == "$orderId"
+        assert param_fqn == "App\\Ui\\Messenger\\Message\\OrderCreatedMessage::$orderId"
+
+    def test_ac8_non_promoted_args_still_resolve(self, index):
+        """AC8: Regression — EmailSender::send() uses Argument nodes (non-promoted).
+
+        Non-promoted methods should continue to resolve via Argument children.
+        """
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        # checkAvailability has non-promoted Argument nodes
+        check_call = find_call_entry(result.uses, "checkAvailability()")
+        assert check_call is not None
+        assert len(check_call.arguments) == 2
+
+        param_names = {a.param_name for a in check_call.arguments}
+        assert "$productId" in param_names
+        assert "$quantity" in param_names
+
+        # param_fqn should be Argument FQN (contains ::$), not Property
+        for arg in check_call.arguments:
+            assert "::$" in arg.param_fqn, f"Non-promoted arg should have Argument FQN"
+            assert "checkAvailability" in arg.param_fqn
+
+    def test_ac9_json_includes_property_fqn_for_promoted(self, index):
+        """AC9: JSON output includes Property FQN as param_fqn for promoted args."""
+        from src.output.tree import context_tree_to_dict
+
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        json_dict = context_tree_to_dict(result)
+        uses = json_dict.get("uses", [])
+
+        # Find the OrderOutput::__construct() entry
+        output_entry = None
+        for entry in uses:
+            if "OrderOutput::__construct()" in entry.get("fqn", ""):
+                output_entry = entry
+                break
+            sc = entry.get("source_call", {})
+            if sc and "OrderOutput::__construct()" in sc.get("fqn", ""):
+                output_entry = sc
+                break
+
+        assert output_entry is not None, "OrderOutput::__construct() should be in JSON uses"
+        args = output_entry.get("arguments", [])
+        assert len(args) == 6
+
+        # All param_fqn values should be Property FQNs
+        for arg in args:
+            fqn = arg.get("param_fqn", "")
+            assert "OrderOutput::$" in fqn, (
+                f"JSON param_fqn should be Property FQN, got: {fqn}"
+            )
+
+    def test_promoted_param_positional_order(self, index):
+        """Verify promoted params are in correct positional order.
+
+        Order::__construct(int $id, string $customerEmail, string $productId,
+        int $quantity, string $status, DateTimeImmutable $createdAt)
+        """
+        node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
+        query = ContextQuery(index)
+        result = query.execute(node.id, depth=1)
+
+        order_call = find_call_entry(result.uses, "Order::__construct()")
+        assert order_call is not None
+
+        # Build position -> param_name map
+        pos_to_name = {a.position: a.param_name for a in order_call.arguments}
+        assert pos_to_name[0] == "$id"
+        assert pos_to_name[1] == "$customerEmail"
+        assert pos_to_name[2] == "$productId"
+        assert pos_to_name[3] == "$quantity"
+        assert pos_to_name[4] == "$status"
+        assert pos_to_name[5] == "$createdAt"

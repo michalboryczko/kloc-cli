@@ -1031,7 +1031,8 @@ class ContextQuery(Query[ContextResult]):
 
         Resolves the Call node's target (callee method/function), gets its
         Argument children in containment order, and returns the name at the
-        requested position.
+        requested position. Falls back to promoted property Value children
+        when no Argument children exist (constructor promotion).
 
         Args:
             call_node_id: ID of the Call node.
@@ -1051,6 +1052,10 @@ class ContextQuery(Query[ContextResult]):
                 arg_nodes.append(child)
         if position < len(arg_nodes):
             return arg_nodes[position].name
+        # Fallback: promoted constructor parameters (Value children, no Argument nodes)
+        promoted = self._get_promoted_params(children)
+        if position < len(promoted):
+            return promoted[position].name
         return None
 
     def _find_result_var(self, call_node_id: str) -> Optional[str]:
@@ -1149,6 +1154,9 @@ class ContextQuery(Query[ContextResult]):
     def _resolve_param_fqn(self, call_node_id: str, position: int) -> Optional[str]:
         """Get the formal parameter FQN at the given position from the callee.
 
+        Falls back to promoted property resolution via assigned_from edges
+        when no Argument children exist (constructor promotion).
+
         Args:
             call_node_id: ID of the Call node.
             position: 0-based argument position.
@@ -1167,7 +1175,43 @@ class ContextQuery(Query[ContextResult]):
                 arg_nodes.append(child)
         if position < len(arg_nodes):
             return arg_nodes[position].fqn
+        # Fallback: promoted constructor parameters — resolve to Property FQN
+        promoted = self._get_promoted_params(children)
+        if position < len(promoted):
+            param_node = promoted[position]
+            # Check for assigned_from edge from a Property node
+            for edge in self.index.incoming[param_node.id].get("assigned_from", []):
+                source_node = self.index.nodes.get(edge.source)
+                if source_node and source_node.kind == "Property":
+                    return source_node.fqn
+            return param_node.fqn
         return None
+
+    def _get_promoted_params(self, children: list[str]) -> list:
+        """Get promoted constructor parameter Value nodes sorted by declaration order.
+
+        For PHP constructor promotion, the callee has Value(parameter) children
+        instead of Argument children. These are sorted by source range to
+        establish positional order matching the constructor signature.
+
+        Args:
+            children: List of child node IDs from get_contains_children().
+
+        Returns:
+            List of NodeData for promoted parameter Value nodes, sorted by position.
+        """
+        param_values = []
+        for child_id in children:
+            child = self.index.nodes.get(child_id)
+            if child and child.kind == "Value" and child.value_kind == "parameter":
+                param_values.append(child)
+        if not param_values:
+            return []
+        param_values.sort(key=lambda n: (
+            n.range.get("start_line", 0) if n.range else 0,
+            n.range.get("start_col", 0) if n.range else 0,
+        ))
+        return param_values
 
     def _trace_source_chain(self, value_node_id: str) -> Optional[list]:
         """Trace the source chain for a result Value node.
@@ -1227,9 +1271,10 @@ class ContextQuery(Query[ContextResult]):
         structural `uses` edges so they still appear in USES output.
 
         Only includes entries where the inferred reference type is a type-related
-        value (parameter_type, return_type, property_type, type_hint).
+        value (property_type, type_hint). Excludes parameter_type and return_type
+        since those are already shown in the DEFINITION section.
         """
-        TYPE_KINDS = {"parameter_type", "return_type", "property_type", "type_hint"}
+        TYPE_KINDS = {"property_type", "type_hint"}
         entries = []
         local_visited: set[str] = set()
 
@@ -1500,9 +1545,64 @@ class ContextQuery(Query[ContextResult]):
 
             entries.append(entry)
 
+        # Filter orphan property accesses consumed by non-Call expressions
+        entries = self._filter_orphan_property_accesses(entries)
+
         # Sort by line number for execution order
         entries.sort(key=lambda e: (e.file or "", e.line if e.line is not None else 0))
         return entries
+
+    def _filter_orphan_property_accesses(self, entries: list[ContextEntry]) -> list[ContextEntry]:
+        """Filter property access entries consumed by non-Call expressions.
+
+        An orphan is a top-level property_access entry whose result is not consumed
+        by any other Call (via receiver or argument edges) but whose access expression
+        appears in another entry's argument value_expr. These are already visible in
+        the consuming argument text (e.g., in sprintf or string concatenation).
+
+        Only filters Kind 2 (call) entries with reference_type == "property_access".
+        Kind 1 (local_variable) entries are never filtered.
+        """
+        # Collect all argument value_expr strings from all entries
+        all_value_exprs: list[str] = []
+        for entry in entries:
+            for arg in entry.arguments:
+                if arg.value_expr:
+                    all_value_exprs.append(arg.value_expr)
+            if entry.source_call:
+                for arg in entry.source_call.arguments:
+                    if arg.value_expr:
+                        all_value_exprs.append(arg.value_expr)
+
+        if not all_value_exprs:
+            return entries
+
+        # Identify orphan property accesses and check if their expression
+        # appears in any other entry's argument value_expr
+        filtered = []
+        for entry in entries:
+            # Only consider Kind 2 property_access entries as orphan candidates
+            if (entry.entry_type == "call"
+                    and entry.member_ref
+                    and entry.member_ref.reference_type == "property_access"
+                    and entry.member_ref.access_chain):
+                # Build the expression: "$receiver->propertyName"
+                # FQN is like "App\Entity\Order::$id", extract "id"
+                prop_fqn = entry.fqn
+                prop_name = prop_fqn.split("::$")[-1] if "::$" in prop_fqn else None
+                if prop_name:
+                    access_expr = f"{entry.member_ref.access_chain}->{prop_name}"
+                    # Check if this expression appears in any value_expr
+                    is_expression_consumed = any(
+                        access_expr in expr for expr in all_value_exprs
+                    )
+                    if is_expression_consumed:
+                        # Orphan: skip this entry
+                        continue
+
+            filtered.append(entry)
+
+        return filtered
 
     def _build_outgoing_tree(
         self, start_id: str, max_depth: int, limit: int, include_impl: bool = False
