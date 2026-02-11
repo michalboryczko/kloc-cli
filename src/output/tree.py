@@ -202,7 +202,31 @@ def print_definition_section(result: ContextResult, console: Console):
     if defn.signature:
         console.print(f"[bold]{defn.signature}[/bold]")
     else:
-        console.print(f"[bold]{defn.kind}[/bold]: {defn.fqn}")
+        # Show value_kind for Value nodes: "Value (local)", "Value (parameter)", etc.
+        kind_display = defn.kind
+        if defn.kind == "Value" and defn.value_kind:
+            kind_display = f"{defn.kind} ({defn.value_kind})"
+        console.print(f"[bold]{kind_display}[/bold]: {defn.fqn}")
+
+    # ISSUE-B: Show type info for Value nodes
+    if defn.type_info:
+        type_display = defn.type_info.get("name", defn.type_info.get("fqn", "?"))
+        console.print(f"  [dim]Type:[/dim] {type_display}")
+
+    # ISSUE-B: Show source for Value nodes
+    if defn.source:
+        source_name = defn.source.get("method_name", "unknown")
+        source_line = defn.source.get("line")
+        if source_line is not None:
+            console.print(f"  [dim]Source:[/dim] {source_name} result (line {source_line + 1})")
+        else:
+            console.print(f"  [dim]Source:[/dim] {source_name}")
+
+    # ISSUE-B: Show scope for Value nodes (via declared_in, rendered later)
+    # Scope is shown as "Scope:" instead of "Defined in:" for Value nodes
+    if defn.kind == "Value" and defn.declared_in:
+        scope_fqn = defn.declared_in.get("fqn", "?")
+        console.print(f"  [dim]Scope:[/dim] {scope_fqn}")
 
     # Show typed arguments for methods/functions
     if defn.arguments:
@@ -254,8 +278,8 @@ def print_definition_section(result: ContextResult, console: Console):
     if defn.uses_traits:
         console.print(f"  [dim]Uses traits:[/dim] {', '.join(defn.uses_traits)}")
 
-    # Show declared-in
-    if defn.declared_in:
+    # Show declared-in (skip for Value nodes — they show "Scope:" instead)
+    if defn.declared_in and defn.kind != "Value":
         declared_fqn = defn.declared_in.get("fqn", "?")
         declared_file = defn.declared_in.get("file")
         declared_line = defn.declared_in.get("line")
@@ -270,7 +294,8 @@ def print_definition_section(result: ContextResult, console: Console):
         location = defn.file
         if defn.line is not None:
             location += f":{defn.line + 1}"
-        console.print(f"  [dim]Defined at:[/dim] {location}")
+        label = "File" if defn.kind == "Value" else "Defined at"
+        console.print(f"  [dim]{label}:[/dim] {location}")
 
     console.print()
 
@@ -546,6 +571,13 @@ def context_tree_to_dict(result: ContextResult) -> dict:
             defn_dict["implements"] = defn.implements
         if defn.uses_traits:
             defn_dict["uses_traits"] = defn.uses_traits
+        # ISSUE-B: Value-specific fields
+        if defn.value_kind:
+            defn_dict["value_kind"] = defn.value_kind
+        if defn.type_info:
+            defn_dict["type"] = defn.type_info
+        if defn.source:
+            defn_dict["source"] = defn.source
         d["definition"] = defn_dict
 
     return d

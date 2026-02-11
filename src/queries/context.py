@@ -567,6 +567,8 @@ class ContextQuery(Query[ContextResult]):
             self._build_property_definition(node_id, node, info)
         elif node.kind == "Argument":
             self._build_argument_definition(node_id, node, info)
+        elif node.kind == "Value":
+            self._build_value_definition(node_id, node, info)
 
         return info
 
@@ -655,6 +657,103 @@ class ContextQuery(Query[ContextResult]):
             if type_node:
                 info.return_type = {"fqn": type_node.fqn, "name": type_node.name}
 
+    def _build_value_definition(self, node_id: str, node: NodeData, info: DefinitionInfo):
+        """Populate definition for Value nodes with data flow metadata.
+
+        Adds value_kind (local/parameter/result/literal/constant), type
+        resolution via type_of edges, and source resolution via
+        assigned_from -> produces -> Call target chain.
+        """
+        # value_kind: local, parameter, result, literal, constant
+        info.value_kind = node.value_kind
+
+        # Type resolution via type_of edges (supports union types)
+        type_ids = self.index.get_type_of_all(node_id)
+        if type_ids:
+            type_names = []
+            first_type_node = None
+            for tid in type_ids:
+                tnode = self.index.nodes.get(tid)
+                if tnode:
+                    type_names.append(tnode.name)
+                    if first_type_node is None:
+                        first_type_node = tnode
+            if type_names and first_type_node:
+                info.type_info = {
+                    "fqn": first_type_node.fqn if len(type_ids) == 1 else "|".join(
+                        self.index.nodes[tid].fqn for tid in type_ids if tid in self.index.nodes
+                    ),
+                    "name": "|".join(type_names),
+                }
+
+        # Source resolution: assigned_from -> produces chain
+        assigned_from_id = self.index.get_assigned_from(node_id)
+        if assigned_from_id:
+            assigned_from_node = self.index.nodes.get(assigned_from_id)
+
+            # Check if assigned_from points to a Property (promoted constructor param)
+            if assigned_from_node and assigned_from_node.kind == "Property":
+                info.source = {
+                    "call_fqn": None,
+                    "method_fqn": assigned_from_node.fqn,
+                    "method_name": f"promotes to {assigned_from_node.fqn}",
+                    "file": assigned_from_node.file,
+                    "line": assigned_from_node.start_line,
+                }
+            else:
+                # Follow to the Call that produced the source Value
+                source_call_id = self.index.get_source_call(assigned_from_id)
+                if source_call_id:
+                    call_node = self.index.nodes.get(source_call_id)
+                    if call_node:
+                        # Find the method being called
+                        call_target_id = self.index.get_call_target(source_call_id)
+                        if call_target_id:
+                            target = self.index.nodes.get(call_target_id)
+                            if target:
+                                method_display = target.name
+                                if target.kind in ("Method", "Function"):
+                                    method_display = f"{target.name}()"
+                                info.source = {
+                                    "call_fqn": call_node.fqn,
+                                    "method_fqn": target.fqn,
+                                    "method_name": method_display,
+                                    "file": call_node.file,
+                                    "line": call_node.start_line,
+                                }
+        elif node.value_kind == "result":
+            # For result values: source is the producing Call directly
+            source_call_id = self.index.get_source_call(node_id)
+            if source_call_id:
+                call_node = self.index.nodes.get(source_call_id)
+                if call_node:
+                    call_target_id = self.index.get_call_target(source_call_id)
+                    if call_target_id:
+                        target = self.index.nodes.get(call_target_id)
+                        if target:
+                            method_display = target.name
+                            if target.kind in ("Method", "Function"):
+                                method_display = f"{target.name}()"
+                            info.source = {
+                                "call_fqn": call_node.fqn,
+                                "method_fqn": target.fqn,
+                                "method_name": method_display,
+                                "file": call_node.file,
+                                "line": call_node.start_line,
+                            }
+
+        # Scope: resolve containing method/function via containment hierarchy
+        scope_id = get_containing_scope(self.index, node_id)
+        if scope_id:
+            scope_node = self.index.nodes.get(scope_id)
+            if scope_node and not info.declared_in:
+                info.declared_in = {
+                    "fqn": scope_node.fqn,
+                    "kind": scope_node.kind,
+                    "file": scope_node.file,
+                    "line": scope_node.start_line,
+                }
+
     def _build_incoming_tree(
         self, start_id: str, max_depth: int, limit: int, include_impl: bool = False,
         direct_only: bool = False, with_imports: bool = False
@@ -703,6 +802,13 @@ class ContextQuery(Query[ContextResult]):
         """
         # Determine if the start node is a class-level query (for R3 filtering)
         start_node = self.index.nodes.get(start_id)
+
+        # Value nodes: use dedicated consumer chain traversal instead of
+        # generic uses-edge traversal. Value nodes have no incoming 'uses'
+        # edges — their consumers are tracked through receiver and argument edges.
+        if start_node and start_node.kind == "Value":
+            return self._build_value_consumer_chain(start_id, 1, max_depth, limit)
+
         is_class_query = start_node and start_node.kind in ("Class", "Interface", "Trait", "Enum")
 
         # Global visited set prevents the same source from appearing at multiple depths
@@ -937,6 +1043,286 @@ class ContextQuery(Query[ContextResult]):
                     interface_entries.append(iface_entry)
 
         return direct_entries + interface_entries
+
+    def _build_value_consumer_chain(
+        self, value_id: str, depth: int, max_depth: int, limit: int
+    ) -> list[ContextEntry]:
+        """Build consumer chain for a Value node (USED BY section).
+
+        Finds all Calls that consume this Value — either as a receiver (property
+        access like $savedOrder->id) or directly as an argument. Groups property
+        accesses by the downstream Call that consumes the accessed property result.
+
+        For receiver edges: each Call that uses this Value as receiver accesses a
+        property/method on it. The result of that access may feed into another Call
+        as an argument — that consuming Call becomes the USED BY entry, with the
+        property access shown as argument mapping.
+
+        For direct argument edges: the Value itself is passed as argument to a Call.
+
+        At depth+1: traces forward into callee body (promoted properties, further usage).
+
+        Args:
+            value_id: The Value node ID to find consumers for.
+            depth: Current depth level.
+            max_depth: Maximum depth to expand.
+            limit: Maximum number of entries.
+
+        Returns:
+            List of ContextEntry representing consuming Calls, sorted by line number.
+        """
+        if depth > max_depth:
+            return []
+
+        entries = []
+        count = 0
+        seen_calls = set()  # Prevent duplicate entries for same consuming Call
+
+        # === Part 1: Receiver edges (property accesses on this Value) ===
+        # Each receiver edge means a Call accesses a property/method on this Value.
+        # Group by consuming Call: $savedOrder->id feeds into send() as $to.
+        receiver_edges = self.index.incoming[value_id].get("receiver", [])
+
+        # Collect property access info grouped by consuming Call
+        # Structure: consumer_call_id -> list of access info dicts
+        consumer_groups: dict[str, list[dict]] = {}
+        # Track standalone receiver calls (property accesses not consumed as arguments)
+        standalone_accesses: list[tuple] = []  # (access_call_id, access_call_node)
+
+        for edge in receiver_edges:
+            access_call_id = edge.source  # The Call that accesses property on this Value
+            access_call_node = self.index.nodes.get(access_call_id)
+            if not access_call_node:
+                continue
+
+            # What property/method does this call access?
+            target_id = self.index.get_call_target(access_call_id)
+            target_node = self.index.nodes.get(target_id) if target_id else None
+
+            # Does this property access produce a result that is used as argument?
+            result_id = self.index.get_produces(access_call_id)
+            found_consumer = False
+
+            if result_id:
+                # Check if result is used as argument in another Call
+                arg_edges = self.index.incoming[result_id].get("argument", [])
+                for arg_edge in arg_edges:
+                    consumer_call_id = arg_edge.source
+                    if consumer_call_id not in consumer_groups:
+                        consumer_groups[consumer_call_id] = []
+                    consumer_groups[consumer_call_id].append({
+                        "prop_name": target_node.name if target_node else "?",
+                        "prop_fqn": target_node.fqn if target_node else None,
+                        "position": arg_edge.position or 0,
+                        "expression": arg_edge.expression,
+                        "access_call_id": access_call_id,
+                        "access_call_line": (
+                            access_call_node.range.get("start_line")
+                            if access_call_node.range else None
+                        ),
+                    })
+                    found_consumer = True
+
+                # Check if result is assigned to another variable
+                if not found_consumer:
+                    assigned_edges = self.index.incoming[result_id].get("assigned_from", [])
+                    if assigned_edges:
+                        found_consumer = True
+                        standalone_accesses.append((access_call_id, access_call_node))
+
+            if not found_consumer:
+                standalone_accesses.append((access_call_id, access_call_node))
+
+        # Build entries for each consuming Call (grouped property accesses)
+        for consumer_call_id, access_infos in consumer_groups.items():
+            if count >= limit:
+                break
+            if consumer_call_id in seen_calls:
+                continue
+            seen_calls.add(consumer_call_id)
+
+            consumer_call_node = self.index.nodes.get(consumer_call_id)
+            if not consumer_call_node:
+                continue
+
+            # Find the method being called by the consumer
+            consumer_target_id = self.index.get_call_target(consumer_call_id)
+            consumer_target = (
+                self.index.nodes.get(consumer_target_id) if consumer_target_id else None
+            )
+
+            consumer_fqn = consumer_target.fqn if consumer_target else consumer_call_node.fqn
+            consumer_kind = consumer_target.kind if consumer_target else consumer_call_node.kind
+            consumer_sig = consumer_target.signature if consumer_target else None
+            call_line = (
+                consumer_call_node.range.get("start_line")
+                if consumer_call_node.range else None
+            )
+
+            # Build argument info for this consuming Call (reuse existing helper)
+            arguments = self._get_argument_info(consumer_call_id)
+
+            # Build member_ref showing the call target
+            member_ref = None
+            if consumer_target:
+                reference_type = get_reference_type_from_call(self.index, consumer_call_id)
+                member_ref = MemberRef(
+                    target_name="",
+                    target_fqn=consumer_target.fqn,
+                    target_kind=consumer_target.kind,
+                    file=consumer_call_node.file,
+                    line=call_line,
+                    reference_type=reference_type,
+                    access_chain=None,
+                    access_chain_symbol=None,
+                )
+
+            entry = ContextEntry(
+                depth=depth,
+                node_id=consumer_target_id or consumer_call_id,
+                fqn=consumer_fqn,
+                kind=consumer_kind,
+                file=consumer_call_node.file,
+                line=call_line,
+                signature=consumer_sig,
+                children=[],
+                member_ref=member_ref,
+                arguments=arguments,
+            )
+
+            # Depth expansion: trace forward into callee body
+            if depth < max_depth and consumer_target_id and consumer_target:
+                if consumer_target.kind in ("Method", "Function"):
+                    children_ids = self.index.get_contains_children(consumer_target_id)
+                    promoted = self._get_promoted_params(children_ids)
+                    if promoted:
+                        # Constructor with promoted params — trace property usages
+                        for access_info in access_infos:
+                            pos = access_info["position"]
+                            if pos < len(promoted):
+                                param_node = promoted[pos]
+                                for af_edge in self.index.incoming[param_node.id].get(
+                                    "assigned_from", []
+                                ):
+                                    prop_node = self.index.nodes.get(af_edge.source)
+                                    if prop_node and prop_node.kind == "Property":
+                                        prop_entry = ContextEntry(
+                                            depth=depth + 1,
+                                            node_id=prop_node.id,
+                                            fqn=prop_node.fqn,
+                                            kind=prop_node.kind,
+                                            file=prop_node.file,
+                                            line=prop_node.start_line,
+                                            children=[],
+                                        )
+                                        entry.children.append(prop_entry)
+
+            count += 1
+            entries.append(entry)
+
+        # === Part 2: Standalone property accesses (not consumed as arguments) ===
+        for access_call_id, access_call_node in standalone_accesses:
+            if count >= limit:
+                break
+            if access_call_id in seen_calls:
+                continue
+            seen_calls.add(access_call_id)
+
+            target_id = self.index.get_call_target(access_call_id)
+            target_node = self.index.nodes.get(target_id) if target_id else None
+            call_line = (
+                access_call_node.range.get("start_line")
+                if access_call_node.range else None
+            )
+
+            reference_type = get_reference_type_from_call(self.index, access_call_id)
+
+            member_ref = MemberRef(
+                target_name=self._member_display_name(target_node) if target_node else "?",
+                target_fqn=target_node.fqn if target_node else "?",
+                target_kind=target_node.kind if target_node else None,
+                file=access_call_node.file,
+                line=call_line,
+                reference_type=reference_type,
+                access_chain=None,
+                access_chain_symbol=None,
+            )
+
+            entry = ContextEntry(
+                depth=depth,
+                node_id=target_id or access_call_id,
+                fqn=target_node.fqn if target_node else access_call_node.fqn,
+                kind=target_node.kind if target_node else access_call_node.kind,
+                file=access_call_node.file,
+                line=call_line,
+                children=[],
+                member_ref=member_ref,
+            )
+            count += 1
+            entries.append(entry)
+
+        # === Part 3: Direct argument edges (Value used directly as argument) ===
+        argument_edges = self.index.incoming[value_id].get("argument", [])
+        for edge in argument_edges:
+            if count >= limit:
+                break
+            consumer_call_id = edge.source
+            if consumer_call_id in seen_calls:
+                continue
+            seen_calls.add(consumer_call_id)
+
+            consumer_call_node = self.index.nodes.get(consumer_call_id)
+            if not consumer_call_node:
+                continue
+
+            consumer_target_id = self.index.get_call_target(consumer_call_id)
+            consumer_target = (
+                self.index.nodes.get(consumer_target_id) if consumer_target_id else None
+            )
+
+            consumer_fqn = consumer_target.fqn if consumer_target else consumer_call_node.fqn
+            consumer_kind = consumer_target.kind if consumer_target else consumer_call_node.kind
+            consumer_sig = consumer_target.signature if consumer_target else None
+            call_line = (
+                consumer_call_node.range.get("start_line")
+                if consumer_call_node.range else None
+            )
+
+            arguments = self._get_argument_info(consumer_call_id)
+
+            member_ref = None
+            if consumer_target:
+                reference_type = get_reference_type_from_call(self.index, consumer_call_id)
+                member_ref = MemberRef(
+                    target_name="",
+                    target_fqn=consumer_target.fqn,
+                    target_kind=consumer_target.kind,
+                    file=consumer_call_node.file,
+                    line=call_line,
+                    reference_type=reference_type,
+                    access_chain=None,
+                    access_chain_symbol=None,
+                )
+
+            entry = ContextEntry(
+                depth=depth,
+                node_id=consumer_target_id or consumer_call_id,
+                fqn=consumer_fqn,
+                kind=consumer_kind,
+                file=consumer_call_node.file,
+                line=call_line,
+                signature=consumer_sig,
+                children=[],
+                member_ref=member_ref,
+                arguments=arguments,
+            )
+            count += 1
+            entries.append(entry)
+
+        # Sort all entries by source line number (AC 12)
+        entries.sort(key=lambda e: (e.file or "", e.line if e.line is not None else 0))
+
+        return entries
 
     def _resolve_containing_method(self, node_id: str) -> Optional[str]:
         """Resolve the containing Method/Function for a given node.
@@ -1631,6 +2017,128 @@ class ContextQuery(Query[ContextResult]):
 
         return filtered
 
+    def _build_value_source_chain(
+        self, value_id: str, depth: int, max_depth: int, limit: int
+    ) -> list[ContextEntry]:
+        """Build source chain for a Value node (USES section).
+
+        Traces: $savedOrder <- save($processedOrder) <- process($order) <- new Order(...)
+        Each depth level follows assigned_from -> produces -> Call, then recursively
+        traces the Call's argument Values' source chains.
+
+        Args:
+            value_id: ID of the Value node to trace from.
+            depth: Current depth level.
+            max_depth: Maximum depth for recursion.
+            limit: Maximum number of entries.
+
+        Returns:
+            List of ContextEntry instances representing the source chain.
+        """
+        if depth > max_depth:
+            return []
+
+        value_node = self.index.nodes.get(value_id)
+        if not value_node or value_node.kind != "Value":
+            return []
+
+        # Follow assigned_from to find source Value
+        assigned_from_id = self.index.get_assigned_from(value_id)
+        source_value_id = assigned_from_id
+
+        # If no assigned_from, check if this is a result value with a source call
+        if not source_value_id and value_node.value_kind == "result":
+            source_value_id = value_id  # Result value IS the source
+
+        if not source_value_id:
+            return []
+
+        # Find the Call that produced the source Value
+        source_call_id = self.index.get_source_call(source_value_id)
+        if not source_call_id:
+            return []
+
+        call_node = self.index.nodes.get(source_call_id)
+        if not call_node:
+            return []
+
+        # Get the call target (callee method/constructor)
+        target_id = self.index.get_call_target(source_call_id)
+        target_node = self.index.nodes.get(target_id) if target_id else None
+
+        if not target_node:
+            return []
+
+        # Build reference type and access chain
+        reference_type = get_reference_type_from_call(self.index, source_call_id)
+        access_chain = build_access_chain(self.index, source_call_id)
+        access_chain_symbol = resolve_access_chain_symbol(self.index, source_call_id)
+
+        # Resolve receiver variable identity
+        on_kind = None
+        on_file = None
+        on_line = None
+        recv_id = self.index.get_receiver(source_call_id)
+        if recv_id:
+            recv_node = self.index.nodes.get(recv_id)
+            if recv_node and recv_node.kind == "Value" and recv_node.value_kind in ("local", "parameter"):
+                on_kind = "local" if recv_node.value_kind == "local" else "param"
+                if recv_node.file:
+                    on_file = recv_node.file
+                if recv_node.range and recv_node.range.get("start_line") is not None:
+                    on_line = recv_node.range["start_line"]
+
+        call_line = call_node.range.get("start_line") if call_node.range else None
+
+        member_ref = MemberRef(
+            target_name="",
+            target_fqn=target_node.fqn,
+            target_kind=target_node.kind,
+            file=call_node.file,
+            line=call_line,
+            reference_type=reference_type,
+            access_chain=access_chain,
+            access_chain_symbol=access_chain_symbol,
+            on_kind=on_kind,
+            on_file=on_file,
+            on_line=on_line,
+        )
+
+        # Reuse _get_argument_info for argument tracking
+        arguments = self._get_argument_info(source_call_id)
+
+        entry = ContextEntry(
+            depth=depth,
+            node_id=target_id,
+            fqn=target_node.fqn,
+            kind=target_node.kind,
+            file=call_node.file,
+            line=call_line,
+            signature=target_node.signature,
+            children=[],
+            implementations=[],
+            member_ref=member_ref,
+            arguments=arguments,
+            result_var=None,
+            entry_type="call",
+        )
+
+        # Recursively trace each argument's source chain at depth+1
+        if depth < max_depth:
+            for arg in arguments:
+                if arg.value_ref_symbol:
+                    # Find this Value node by FQN and trace its source
+                    arg_value_matches = self.index.resolve_symbol(arg.value_ref_symbol)
+                    if arg_value_matches:
+                        arg_value_node = arg_value_matches[0]
+                        if arg_value_node.kind == "Value":
+                            children = self._build_value_source_chain(
+                                arg_value_node.id, depth + 1, max_depth, limit
+                            )
+                            entry.children.extend(children)
+
+        return [entry]
+
     def _build_outgoing_tree(
         self, start_id: str, max_depth: int, limit: int, include_impl: bool = False
     ) -> list[ContextEntry]:
@@ -1673,6 +2181,10 @@ class ContextQuery(Query[ContextResult]):
             )
             # Combine: type references first, then call entries in execution order
             return type_entries + call_entries
+
+        # For Value nodes, use source chain traversal
+        if start_node and start_node.kind == "Value":
+            return self._build_value_source_chain(start_id, 1, max_depth, limit)
 
         def build_tree(current_id: str, current_depth: int) -> list[ContextEntry]:
             if current_depth > max_depth or count[0] >= limit:

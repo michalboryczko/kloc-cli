@@ -267,3 +267,7 @@ class DefinitionInfo:
     extends: Optional[str] = None
     implements: list[str] = field(default_factory=list)
     uses_traits: list[str] = field(default_factory=list)
+    # ISSUE-B: Value-specific fields
+    value_kind: Optional[str] = None      # "local", "parameter", "result", "literal", "constant"
+    type_info: Optional[dict] = None      # {"fqn": ..., "name": ...}
+    source: Optional[dict] = None         # {"call_fqn": ..., "method_fqn": ..., "method_name": ..., ...}
