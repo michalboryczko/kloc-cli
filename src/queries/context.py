@@ -2265,6 +2265,20 @@ class ContextQuery(Query[ContextResult]):
                                 arg_value_node.id, depth + 1, max_depth, limit, visited
                             )
                             entry.children.extend(children)
+                elif arg.source_chain:
+                    # Result argument (e.g., $input->customerEmail) — trace the
+                    # receiver Value to follow data flow across method boundaries
+                    for step in arg.source_chain:
+                        on_fqn = step.get("on")
+                        if on_fqn:
+                            on_matches = self.index.resolve_symbol(on_fqn)
+                            if on_matches:
+                                on_node = on_matches[0]
+                                if on_node.kind == "Value":
+                                    children = self._build_value_source_chain(
+                                        on_node.id, depth + 1, max_depth, limit, visited
+                                    )
+                                    entry.children.extend(children)
 
         return [entry]
 
