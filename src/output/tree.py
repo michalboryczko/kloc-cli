@@ -392,6 +392,10 @@ def print_context_tree(result: ContextResult, console: Console):
 
             branch = parent.add(label)
 
+            # ISSUE-E: Show boundary crossing indicator
+            if entry.crossed_from:
+                branch.add(f"[dim italic]crosses into {entry.crossed_from}[/dim italic]")
+
             # Show implementations for interfaces/methods (with their children)
             if show_impl and entry.implementations:
                 for impl in entry.implementations:
@@ -527,6 +531,9 @@ def context_tree_to_dict(result: ContextResult) -> dict:
             d["variable_type"] = entry.variable_type
         if entry.source_call:
             d["source_call"] = context_entry_to_dict(entry.source_call)
+        # ISSUE-E: Cross-method boundary crossing indicator
+        if entry.crossed_from:
+            d["crossed_from"] = entry.crossed_from
         return d
 
     target_dict = {

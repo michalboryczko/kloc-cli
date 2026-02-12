@@ -63,6 +63,7 @@ class SoTIndex:
                 location=e.get("location"),
                 position=e.get("position"),
                 expression=e.get("expression"),
+                parameter=e.get("parameter"),
             )
             self.edges.append(edge)
 
@@ -127,6 +128,11 @@ class SoTIndex:
         if query_normalized in self.fqn_to_ids:
             for node_id in self.fqn_to_ids[query_normalized]:
                 add_candidate(self.nodes[node_id])
+            # When Value and Argument nodes share the same FQN, keep only Value
+            if len(candidates) > 1:
+                has_value = any(n.kind == "Value" for n in candidates)
+                if has_value:
+                    candidates = [n for n in candidates if n.kind != "Argument"]
             return candidates
 
         # Try case-insensitive FQN
@@ -498,12 +504,12 @@ class SoTIndex:
         # Fallback: return the first class
         return class_children[0]
 
-    def get_arguments(self, call_node_id: str) -> list[tuple[str, int, Optional[str]]]:
+    def get_arguments(self, call_node_id: str) -> list[tuple[str, int, Optional[str], Optional[str]]]:
         """Get argument Value node IDs with their positions for a Call node.
 
         Returns:
-            List of (value_node_id, position, expression) tuples sorted by position.
+            List of (value_node_id, position, expression, parameter) tuples sorted by position.
         """
         edges = self.outgoing[call_node_id].get("argument", [])
-        args = [(e.target, e.position or 0, e.expression) for e in edges]
+        args = [(e.target, e.position or 0, e.expression, e.parameter) for e in edges]
         return sorted(args, key=lambda x: x[1])

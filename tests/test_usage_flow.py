@@ -2372,9 +2372,9 @@ class TestIssueA_ConstructorPromotionResolution:
         assert "$productId" in param_names
         assert "$quantity" in param_names
 
-        # param_fqn should be Argument FQN (contains ::$), not Property
+        # param_fqn should be parameter FQN (contains .$), not Property FQN
         for arg in check_call.arguments:
-            assert "::$" in arg.param_fqn, f"Non-promoted arg should have Argument FQN"
+            assert ".$" in arg.param_fqn, f"Non-promoted arg should have parameter FQN with . separator"
             assert "checkAvailability" in arg.param_fqn
 
     def test_ac9_json_includes_property_fqn_for_promoted(self, index):

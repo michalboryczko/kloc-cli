@@ -209,15 +209,15 @@ def v2_sot_with_expression():
 
 class TestGetArgumentsWithExpression:
     def test_returns_expression(self, v2_sot_with_expression):
-        """get_arguments() should return 3-tuple with expression."""
+        """get_arguments() should return 4-tuple with expression and parameter."""
         idx = SoTIndex(v2_sot_with_expression)
         args = idx.get_arguments("node:call:abc")
 
         assert len(args) == 2
-        # First arg has expression
-        assert args[0] == ("node:val:arg0", 0, "$input->productId")
-        # Second arg has no expression
-        assert args[1] == ("node:val:arg1", 1, None)
+        # First arg has expression, no parameter
+        assert args[0] == ("node:val:arg0", 0, "$input->productId", None)
+        # Second arg has no expression, no parameter
+        assert args[1] == ("node:val:arg1", 1, None, None)
 
     def test_sorted_by_position(self, v2_sot_with_expression):
         """Arguments should be sorted by position."""

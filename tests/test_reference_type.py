@@ -359,7 +359,7 @@ class TestExpressionPreference:
 
         index = _ArgumentMockIndex(
             nodes={"value:1": value_node},
-            arguments={"call:1": [("value:1", 0, "$input->productId")]},
+            arguments={"call:1": [("value:1", 0, "$input->productId", None)]},
             call_targets={},
         )
 
@@ -384,7 +384,7 @@ class TestExpressionPreference:
 
         index = _ArgumentMockIndex(
             nodes={"value:2": value_node},
-            arguments={"call:2": [("value:2", 0, None)]},
+            arguments={"call:2": [("value:2", 0, None, None)]},
             call_targets={},
         )
 
@@ -409,7 +409,7 @@ class TestExpressionPreference:
 
         index = _ArgumentMockIndex(
             nodes={"value:3": value_node},
-            arguments={"call:3": [("value:3", 0, "")]},
+            arguments={"call:3": [("value:3", 0, "", None)]},
             call_targets={},
         )
 

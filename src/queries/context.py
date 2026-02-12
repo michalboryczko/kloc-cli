@@ -807,7 +807,11 @@ class ContextQuery(Query[ContextResult]):
         # generic uses-edge traversal. Value nodes have no incoming 'uses'
         # edges — their consumers are tracked through receiver and argument edges.
         if start_node and start_node.kind == "Value":
-            return self._build_value_consumer_chain(start_id, 1, max_depth, limit)
+            return self._build_value_consumer_chain(start_id, 1, max_depth, limit, visited=set())
+
+        # ISSUE-F: Property nodes — trace who reads this property across methods
+        if start_node and start_node.kind == "Property":
+            return self._build_property_used_by(start_id, 1, max_depth, limit)
 
         is_class_query = start_node and start_node.kind in ("Class", "Interface", "Trait", "Enum")
 
@@ -1045,7 +1049,8 @@ class ContextQuery(Query[ContextResult]):
         return direct_entries + interface_entries
 
     def _build_value_consumer_chain(
-        self, value_id: str, depth: int, max_depth: int, limit: int
+        self, value_id: str, depth: int, max_depth: int, limit: int,
+        visited: set | None = None
     ) -> list[ContextEntry]:
         """Build consumer chain for a Value node (USED BY section).
 
@@ -1061,18 +1066,27 @@ class ContextQuery(Query[ContextResult]):
         For direct argument edges: the Value itself is passed as argument to a Call.
 
         At depth+1: traces forward into callee body (promoted properties, further usage).
+        Cross-method: when Value is passed as argument, crosses into callee to trace
+        the matching parameter's consumers recursively (ISSUE-E).
 
         Args:
             value_id: The Value node ID to find consumers for.
             depth: Current depth level.
             max_depth: Maximum depth to expand.
             limit: Maximum number of entries.
+            visited: Set of visited Value IDs for cycle detection.
 
         Returns:
             List of ContextEntry representing consuming Calls, sorted by line number.
         """
         if depth > max_depth:
             return []
+
+        if visited is None:
+            visited = set()
+        if value_id in visited:
+            return []
+        visited.add(value_id)
 
         entries = []
         count = 0
@@ -1166,6 +1180,7 @@ class ContextQuery(Query[ContextResult]):
             member_ref = None
             if consumer_target:
                 reference_type = get_reference_type_from_call(self.index, consumer_call_id)
+                ac, acs, ok, of, ol = self._resolve_receiver_identity(consumer_call_id)
                 member_ref = MemberRef(
                     target_name="",
                     target_fqn=consumer_target.fqn,
@@ -1173,8 +1188,11 @@ class ContextQuery(Query[ContextResult]):
                     file=consumer_call_node.file,
                     line=call_line,
                     reference_type=reference_type,
-                    access_chain=None,
-                    access_chain_symbol=None,
+                    access_chain=ac,
+                    access_chain_symbol=acs,
+                    on_kind=ok,
+                    on_file=of,
+                    on_line=ol,
                 )
 
             entry = ContextEntry(
@@ -1217,6 +1235,12 @@ class ContextQuery(Query[ContextResult]):
                                         )
                                         entry.children.append(prop_entry)
 
+                    # ISSUE-E: Cross-method USED BY — cross into callee via parameter FQN
+                    self._cross_into_callee(
+                        consumer_call_id, consumer_target_id, consumer_target,
+                        entry, depth, max_depth, limit, visited
+                    )
+
             count += 1
             entries.append(entry)
 
@@ -1236,6 +1260,7 @@ class ContextQuery(Query[ContextResult]):
             )
 
             reference_type = get_reference_type_from_call(self.index, access_call_id)
+            ac, acs, ok, of, ol = self._resolve_receiver_identity(access_call_id)
 
             member_ref = MemberRef(
                 target_name=self._member_display_name(target_node) if target_node else "?",
@@ -1244,8 +1269,11 @@ class ContextQuery(Query[ContextResult]):
                 file=access_call_node.file,
                 line=call_line,
                 reference_type=reference_type,
-                access_chain=None,
-                access_chain_symbol=None,
+                access_chain=ac,
+                access_chain_symbol=acs,
+                on_kind=ok,
+                on_file=of,
+                on_line=ol,
             )
 
             entry = ContextEntry(
@@ -1293,6 +1321,7 @@ class ContextQuery(Query[ContextResult]):
             member_ref = None
             if consumer_target:
                 reference_type = get_reference_type_from_call(self.index, consumer_call_id)
+                ac, acs, ok, of, ol = self._resolve_receiver_identity(consumer_call_id)
                 member_ref = MemberRef(
                     target_name="",
                     target_fqn=consumer_target.fqn,
@@ -1300,8 +1329,11 @@ class ContextQuery(Query[ContextResult]):
                     file=consumer_call_node.file,
                     line=call_line,
                     reference_type=reference_type,
-                    access_chain=None,
-                    access_chain_symbol=None,
+                    access_chain=ac,
+                    access_chain_symbol=acs,
+                    on_kind=ok,
+                    on_file=of,
+                    on_line=ol,
                 )
 
             entry = ContextEntry(
@@ -1316,6 +1348,15 @@ class ContextQuery(Query[ContextResult]):
                 member_ref=member_ref,
                 arguments=arguments,
             )
+
+            # ISSUE-E: Cross-method USED BY — cross into callee via parameter FQN
+            if depth < max_depth and consumer_target_id and consumer_target:
+                if consumer_target.kind in ("Method", "Function"):
+                    self._cross_into_callee(
+                        consumer_call_id, consumer_target_id, consumer_target,
+                        entry, depth, max_depth, limit, visited
+                    )
+
             count += 1
             entries.append(entry)
 
@@ -1323,6 +1364,80 @@ class ContextQuery(Query[ContextResult]):
         entries.sort(key=lambda e: (e.file or "", e.line if e.line is not None else 0))
 
         return entries
+
+    def _cross_into_callee(
+        self, call_node_id: str, callee_id: str, callee_node,
+        entry: "ContextEntry", depth: int, max_depth: int, limit: int,
+        visited: set
+    ) -> None:
+        """Cross method boundary from caller into callee for USED BY tracing.
+
+        For each argument edge with a parameter FQN, finds the matching
+        Value(parameter) node in the callee and recursively traces its consumers.
+
+        Also follows the return value path: if the call produces a result
+        assigned to a local variable, traces that local's consumers.
+
+        Args:
+            call_node_id: The Call node in the caller.
+            callee_id: The callee Method/Function node ID.
+            callee_node: The callee Method/Function NodeData.
+            entry: The ContextEntry to attach children to.
+            depth: Current depth level.
+            max_depth: Maximum depth.
+            limit: Maximum entries.
+            visited: Visited Value IDs for cycle detection.
+        """
+        # Cross into callee via argument parameter FQNs
+        arg_edges = self.index.get_arguments(call_node_id)
+        for _, _, _, parameter_fqn in arg_edges:
+            if not parameter_fqn:
+                continue
+            # Find the matching Value(parameter) node by FQN
+            param_matches = self.index.resolve_symbol(parameter_fqn)
+            for pm in param_matches:
+                if pm.kind == "Value" and pm.value_kind == "parameter":
+                    if pm.id not in visited:
+                        child_entries = self._build_value_consumer_chain(
+                            pm.id, depth + 1, max_depth, limit, visited
+                        )
+                        for ce in child_entries:
+                            if not ce.crossed_from:
+                                ce.crossed_from = parameter_fqn
+                        entry.children.extend(child_entries)
+                    break
+
+        # Return value path: if callee return flows back to a local in caller
+        local_value = self._find_local_value_for_call(call_node_id)
+        if local_value and local_value.id not in visited:
+            return_entries = self._build_value_consumer_chain(
+                local_value.id, depth + 1, max_depth, limit, visited
+            )
+            entry.children.extend(return_entries)
+
+    def _resolve_receiver_identity(self, call_node_id: str) -> tuple[
+        Optional[str], Optional[str], Optional[str], Optional[str], Optional[int]
+    ]:
+        """Resolve access chain and receiver identity for a Call node.
+
+        Returns:
+            (access_chain, access_chain_symbol, on_kind, on_file, on_line)
+        """
+        access_chain = build_access_chain(self.index, call_node_id)
+        access_chain_symbol = resolve_access_chain_symbol(self.index, call_node_id)
+        on_kind = None
+        on_file = None
+        on_line = None
+        recv_id = self.index.get_receiver(call_node_id)
+        if recv_id:
+            recv_node = self.index.nodes.get(recv_id)
+            if recv_node and recv_node.kind == "Value" and recv_node.value_kind in ("local", "parameter"):
+                on_kind = "local" if recv_node.value_kind == "local" else "param"
+                if recv_node.file:
+                    on_file = recv_node.file
+                if recv_node.range and recv_node.range.get("start_line") is not None:
+                    on_line = recv_node.range["start_line"]
+        return access_chain, access_chain_symbol, on_kind, on_file, on_line
 
     def _resolve_containing_method(self, node_id: str) -> Optional[str]:
         """Resolve the containing Method/Function for a given node.
@@ -1494,11 +1609,18 @@ class ContextQuery(Query[ContextResult]):
 
         arg_edges = self.index.get_arguments(call_node_id)
         arguments = []
-        for arg_node_id, position, expression in arg_edges:
+        for arg_node_id, position, expression, parameter in arg_edges:
             arg_node = self.index.nodes.get(arg_node_id)
             if arg_node:
-                param_name = self._resolve_param_name(call_node_id, position)
-                param_fqn = self._resolve_param_fqn(call_node_id, position)
+                # Use parameter field from edge if available, fall back to position-based matching
+                if parameter:
+                    # Extract param_name from original parameter FQN (uses . separator)
+                    param_name = parameter.rsplit(".", 1)[-1] if "." in parameter else parameter
+                    # For promoted constructor params, resolve to Property FQN via assigned_from
+                    param_fqn = self._resolve_promoted_property_fqn(parameter) or parameter
+                else:
+                    param_name = self._resolve_param_name(call_node_id, position)
+                    param_fqn = self._resolve_param_fqn(call_node_id, position)
 
                 # Resolve value type via type_of edges
                 value_type = None
@@ -1571,6 +1693,28 @@ class ContextQuery(Query[ContextResult]):
                 if source_node and source_node.kind == "Property":
                     return source_node.fqn
             return param_node.fqn
+        return None
+
+    def _resolve_promoted_property_fqn(self, param_fqn: str) -> Optional[str]:
+        """Resolve a parameter FQN to its promoted Property FQN if applicable.
+
+        For PHP constructor promotion, the parameter Value node has an
+        assigned_from edge from a Property node. This returns the Property FQN.
+
+        Args:
+            param_fqn: The parameter FQN (e.g., Order::__construct().$id).
+
+        Returns:
+            Property FQN if promoted, None otherwise.
+        """
+        param_ids = self.index.fqn_to_ids.get(param_fqn, [])
+        for param_id in param_ids:
+            param_node = self.index.nodes.get(param_id)
+            if param_node and param_node.kind == "Value" and param_node.value_kind == "parameter":
+                for edge in self.index.incoming[param_id].get("assigned_from", []):
+                    source_node = self.index.nodes.get(edge.source)
+                    if source_node and source_node.kind == "Property":
+                        return source_node.fqn
         return None
 
     def _get_promoted_params(self, children: list[str]) -> list:
@@ -1793,7 +1937,7 @@ class ContextQuery(Query[ContextResult]):
                         consumed.add(source_call_id)
             # Check arguments: if any arg Value is a result of another call
             arg_edges = self.index.get_arguments(call_id)
-            for arg_id, _, _ in arg_edges:
+            for arg_id, _, _, _ in arg_edges:
                 arg_node = self.index.nodes.get(arg_id)
                 if arg_node and arg_node.value_kind == "result":
                     src = self.index.get_source_call(arg_id)
@@ -1827,24 +1971,9 @@ class ContextQuery(Query[ContextResult]):
 
             count[0] += 1
             reference_type = get_reference_type_from_call(self.index, child_id)
-            access_chain = build_access_chain(self.index, child_id)
-            access_chain_symbol = resolve_access_chain_symbol(self.index, child_id)
+            ac, acs, ok, of, ol = self._resolve_receiver_identity(child_id)
             arguments = self._get_argument_info(child_id)
             call_line = child.range.get("start_line") if child.range else None
-
-            # Resolve receiver variable identity for on: display
-            on_kind = None
-            on_file = None
-            on_line = None
-            recv_id = self.index.get_receiver(child_id)
-            if recv_id:
-                recv_node = self.index.nodes.get(recv_id)
-                if recv_node and recv_node.kind == "Value" and recv_node.value_kind in ("local", "parameter"):
-                    on_kind = "local" if recv_node.value_kind == "local" else "param"
-                    if recv_node.file:
-                        on_file = recv_node.file
-                    if recv_node.range and recv_node.range.get("start_line") is not None:
-                        on_line = recv_node.range["start_line"]
 
             member_ref = MemberRef(
                 target_name="",
@@ -1853,11 +1982,11 @@ class ContextQuery(Query[ContextResult]):
                 file=child.file,
                 line=call_line,
                 reference_type=reference_type,
-                access_chain=access_chain,
-                access_chain_symbol=access_chain_symbol,
-                on_kind=on_kind,
-                on_file=on_file,
-                on_line=on_line,
+                access_chain=ac,
+                access_chain_symbol=acs,
+                on_kind=ok,
+                on_file=of,
+                on_line=ol,
             )
 
             # Check if this call's result is assigned to a local variable
@@ -2018,7 +2147,8 @@ class ContextQuery(Query[ContextResult]):
         return filtered
 
     def _build_value_source_chain(
-        self, value_id: str, depth: int, max_depth: int, limit: int
+        self, value_id: str, depth: int, max_depth: int, limit: int,
+        visited: set | None = None
     ) -> list[ContextEntry]:
         """Build source chain for a Value node (USES section).
 
@@ -2026,11 +2156,15 @@ class ContextQuery(Query[ContextResult]):
         Each depth level follows assigned_from -> produces -> Call, then recursively
         traces the Call's argument Values' source chains.
 
+        For parameter Values: crosses method boundary to find callers via argument
+        edges with matching parameter FQN (ISSUE-E).
+
         Args:
             value_id: ID of the Value node to trace from.
             depth: Current depth level.
             max_depth: Maximum depth for recursion.
             limit: Maximum number of entries.
+            visited: Set of visited Value IDs for cycle detection.
 
         Returns:
             List of ContextEntry instances representing the source chain.
@@ -2038,9 +2172,19 @@ class ContextQuery(Query[ContextResult]):
         if depth > max_depth:
             return []
 
+        if visited is None:
+            visited = set()
+        if value_id in visited:
+            return []
+        visited.add(value_id)
+
         value_node = self.index.nodes.get(value_id)
         if not value_node or value_node.kind != "Value":
             return []
+
+        # ISSUE-E: Parameter Values have no local sources — find callers via argument edges
+        if value_node.value_kind == "parameter":
+            return self._build_parameter_uses(value_id, value_node, depth, max_depth, limit, visited)
 
         # Follow assigned_from to find source Value
         assigned_from_id = self.index.get_assigned_from(value_id)
@@ -2071,22 +2215,7 @@ class ContextQuery(Query[ContextResult]):
 
         # Build reference type and access chain
         reference_type = get_reference_type_from_call(self.index, source_call_id)
-        access_chain = build_access_chain(self.index, source_call_id)
-        access_chain_symbol = resolve_access_chain_symbol(self.index, source_call_id)
-
-        # Resolve receiver variable identity
-        on_kind = None
-        on_file = None
-        on_line = None
-        recv_id = self.index.get_receiver(source_call_id)
-        if recv_id:
-            recv_node = self.index.nodes.get(recv_id)
-            if recv_node and recv_node.kind == "Value" and recv_node.value_kind in ("local", "parameter"):
-                on_kind = "local" if recv_node.value_kind == "local" else "param"
-                if recv_node.file:
-                    on_file = recv_node.file
-                if recv_node.range and recv_node.range.get("start_line") is not None:
-                    on_line = recv_node.range["start_line"]
+        ac, acs, ok, of, ol = self._resolve_receiver_identity(source_call_id)
 
         call_line = call_node.range.get("start_line") if call_node.range else None
 
@@ -2097,11 +2226,11 @@ class ContextQuery(Query[ContextResult]):
             file=call_node.file,
             line=call_line,
             reference_type=reference_type,
-            access_chain=access_chain,
-            access_chain_symbol=access_chain_symbol,
-            on_kind=on_kind,
-            on_file=on_file,
-            on_line=on_line,
+            access_chain=ac,
+            access_chain_symbol=acs,
+            on_kind=ok,
+            on_file=of,
+            on_line=ol,
         )
 
         # Reuse _get_argument_info for argument tracking
@@ -2133,11 +2262,186 @@ class ContextQuery(Query[ContextResult]):
                         arg_value_node = arg_value_matches[0]
                         if arg_value_node.kind == "Value":
                             children = self._build_value_source_chain(
-                                arg_value_node.id, depth + 1, max_depth, limit
+                                arg_value_node.id, depth + 1, max_depth, limit, visited
                             )
                             entry.children.extend(children)
 
         return [entry]
+
+    def _build_parameter_uses(
+        self, param_value_id: str, param_node, depth: int, max_depth: int,
+        limit: int, visited: set
+    ) -> list[ContextEntry]:
+        """Find callers of a parameter Value via argument edges with matching parameter FQN.
+
+        Searches all argument edges in the graph where the `parameter` field matches
+        this Value's FQN, then traces the source of each caller's argument Value.
+
+        Args:
+            param_value_id: ID of the parameter Value node.
+            param_node: The parameter Value NodeData.
+            depth: Current depth level.
+            max_depth: Maximum depth.
+            limit: Maximum entries.
+            visited: Visited Value IDs for cycle detection.
+
+        Returns:
+            List of ContextEntry representing caller-provided sources.
+        """
+        entries = []
+        param_fqn = param_node.fqn
+
+        # Search argument edges where parameter field matches this FQN
+        for edge in self.index.edges:
+            if edge.type != "argument":
+                continue
+            if edge.parameter != param_fqn:
+                continue
+
+            # Found a caller's argument edge
+            caller_call_id = edge.source  # Call node in the caller
+            caller_value_id = edge.target  # Value passed by the caller
+
+            call_node = self.index.nodes.get(caller_call_id)
+            caller_value = self.index.nodes.get(caller_value_id)
+            if not call_node or not caller_value:
+                continue
+
+            # Find the containing method of the caller
+            scope_id = get_containing_scope(self.index, caller_call_id)
+            scope_node = self.index.nodes.get(scope_id) if scope_id else None
+
+            call_line = call_node.range.get("start_line") if call_node.range else None
+
+            entry = ContextEntry(
+                depth=depth,
+                node_id=scope_id or caller_call_id,
+                fqn=scope_node.fqn if scope_node else call_node.fqn,
+                kind=scope_node.kind if scope_node else call_node.kind,
+                file=call_node.file,
+                line=call_line,
+                signature=scope_node.signature if scope_node else None,
+                children=[],
+                crossed_from=param_fqn,
+            )
+
+            # Trace the caller's argument Value's source chain (recurse with depth+1)
+            if depth < max_depth and caller_value_id not in visited:
+                child_entries = self._build_value_source_chain(
+                    caller_value_id, depth + 1, max_depth, limit, visited
+                )
+                entry.children.extend(child_entries)
+
+            entries.append(entry)
+            if len(entries) >= limit:
+                break
+
+        entries.sort(key=lambda e: (e.file or "", e.line if e.line is not None else 0))
+        return entries
+
+    def _build_property_uses(
+        self, property_id: str, depth: int, max_depth: int, limit: int
+    ) -> list[ContextEntry]:
+        """Build USES chain for a Property node.
+
+        For promoted constructor properties: follow assigned_from edge to
+        Value(parameter), then trace callers via ISSUE-E USES.
+
+        For other properties: follow assigned_from edges to source Values.
+        """
+        if depth > max_depth:
+            return []
+
+        visited = set()
+
+        # Check for assigned_from edges (promoted property -> Value(parameter))
+        assigned_edges = self.index.outgoing[property_id].get("assigned_from", [])
+        for edge in assigned_edges:
+            source_node = self.index.nodes.get(edge.target)
+            if source_node and source_node.kind == "Value" and source_node.value_kind == "parameter":
+                # Promoted property: trace the parameter's callers
+                return self._build_value_source_chain(
+                    source_node.id, depth, max_depth, limit, visited
+                )
+
+        # No assigned_from from parameter: property may be set by DI container or direct assignment
+        return []
+
+    def _build_property_used_by(
+        self, property_id: str, depth: int, max_depth: int, limit: int
+    ) -> list[ContextEntry]:
+        """Build USED BY chain for a Property node.
+
+        Finds all Calls that access this Property (via 'calls' edges targeting
+        the Property), gets the result Value of each access, then traces
+        consumers via ISSUE-E USED BY.
+        """
+        if depth > max_depth:
+            return []
+
+        entries = []
+        visited = set()
+        count = 0
+
+        # Find all Call nodes that target this Property (via 'calls' edges)
+        call_ids = self.index.get_calls_to(property_id)
+
+        for call_id in call_ids:
+            if count >= limit:
+                break
+            call_node = self.index.nodes.get(call_id)
+            if not call_node:
+                continue
+
+            call_line = call_node.range.get("start_line") if call_node.range else None
+            reference_type = get_reference_type_from_call(self.index, call_id)
+            ac, acs, ok, of, ol = self._resolve_receiver_identity(call_id)
+
+            # Find the containing method for this access
+            scope_id = get_containing_scope(self.index, call_id)
+            scope_node = self.index.nodes.get(scope_id) if scope_id else None
+
+            property_node = self.index.nodes.get(property_id)
+
+            member_ref = MemberRef(
+                target_name=self._member_display_name(property_node) if property_node else "?",
+                target_fqn=property_node.fqn if property_node else "?",
+                target_kind="Property",
+                file=call_node.file,
+                line=call_line,
+                reference_type=reference_type,
+                access_chain=ac,
+                access_chain_symbol=acs,
+                on_kind=ok,
+                on_file=of,
+                on_line=ol,
+            )
+
+            entry = ContextEntry(
+                depth=depth,
+                node_id=scope_id or call_id,
+                fqn=scope_node.fqn if scope_node else call_node.fqn,
+                kind=scope_node.kind if scope_node else call_node.kind,
+                file=call_node.file,
+                line=call_line,
+                signature=scope_node.signature if scope_node else None,
+                children=[],
+                member_ref=member_ref,
+            )
+
+            # Trace the result Value's consumers (cross-method via ISSUE-E)
+            result_id = self.index.get_produces(call_id)
+            if result_id and depth < max_depth:
+                child_entries = self._build_value_consumer_chain(
+                    result_id, depth + 1, max_depth, limit, visited
+                )
+                entry.children.extend(child_entries)
+
+            count += 1
+            entries.append(entry)
+
+        entries.sort(key=lambda e: (e.file or "", e.line if e.line is not None else 0))
+        return entries
 
     def _build_outgoing_tree(
         self, start_id: str, max_depth: int, limit: int, include_impl: bool = False
@@ -2184,7 +2488,11 @@ class ContextQuery(Query[ContextResult]):
 
         # For Value nodes, use source chain traversal
         if start_node and start_node.kind == "Value":
-            return self._build_value_source_chain(start_id, 1, max_depth, limit)
+            return self._build_value_source_chain(start_id, 1, max_depth, limit, visited=set())
+
+        # ISSUE-F: Property nodes — trace who sets this property (assigned_from -> parameter -> callers)
+        if start_node and start_node.kind == "Property":
+            return self._build_property_uses(start_id, 1, max_depth, limit)
 
         def build_tree(current_id: str, current_depth: int) -> list[ContextEntry]:
             if current_depth > max_depth or count[0] >= limit:

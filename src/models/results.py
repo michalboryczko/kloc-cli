@@ -160,6 +160,8 @@ class ContextEntry:
     variable_symbol: Optional[str] = None  # "local#32$order" for Kind 1 entries
     variable_type: Optional[str] = None  # "Order" for Kind 1 entries
     source_call: Optional["ContextEntry"] = None  # Nested call for Kind 1 entries
+    # ISSUE-E: Cross-method boundary crossing indicator
+    crossed_from: Optional[str] = None  # FQN of the parameter crossed from
 
 
 @dataclass

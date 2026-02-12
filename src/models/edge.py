@@ -14,6 +14,7 @@ class EdgeData:
     location: Optional[dict] = None
     position: Optional[int] = None  # For argument edges: 0-based argument index
     expression: Optional[str] = None  # For argument edges: source expression text
+    parameter: Optional[str] = None  # For argument edges: formal parameter FQN
 
     @property
     def location_str(self) -> Optional[str]:
