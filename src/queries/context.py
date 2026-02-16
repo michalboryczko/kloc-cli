@@ -4761,11 +4761,17 @@ class ContextQuery(Query[ContextResult]):
             return []
 
         entries = []
-        # Collect uses edges + extends edges (get_deps only returns uses)
-        edges = list(self.index.get_deps(target_id, include_members=True))
+        # Collect extends edges FIRST (highest priority), then uses edges.
+        # This ensures extends relationships are not shadowed by duplicate
+        # uses edges to the same target (ISSUE-F fix).
+        edges: list[EdgeData] = []
         for ext_edge in self.index.outgoing[target_id].get("extends", []):
             edges.append(ext_edge)
+        edges.extend(self.index.get_deps(target_id, include_members=True))
         local_visited: set[str] = set()
+
+        # Get the source node for file references on extends entries
+        source_node_for_extends = self.index.nodes.get(target_id)
 
         for edge in edges:
             dep_id = edge.target
@@ -4803,13 +4809,23 @@ class ContextQuery(Query[ContextResult]):
                     if not property_name.startswith("$"):
                         property_name = "$" + property_name
 
+            # File reference: for extends edges, point to the source declaration
+            # (where "extends X" is declared), not the target's definition.
+            # Use edge location if available, else fall back to the source node.
+            if edge.type == "extends" and source_node_for_extends:
+                file = edge.location.get("file") if edge.location else source_node_for_extends.file
+                line = edge.location.get("line") if edge.location else source_node_for_extends.start_line
+            else:
+                file = edge.location.get("file") if edge.location else resolved_node.file
+                line = edge.location.get("line") if edge.location else resolved_node.start_line
+
             entry = ContextEntry(
                 depth=depth,
                 node_id=resolved_id,
                 fqn=resolved_node.fqn,
                 kind=resolved_node.kind,
-                file=resolved_node.file,
-                line=resolved_node.start_line,
+                file=file,
+                line=line,
                 ref_type=ref_type,
                 property_name=property_name,
                 children=[],
@@ -4822,6 +4838,47 @@ class ContextQuery(Query[ContextResult]):
                 )
 
             entries.append(entry)
+
+        # ISSUE-K: Add non-scalar property type entries from the target class.
+        # Properties with type_hint edges to Class/Interface are structural deps
+        # that should appear in the USES tree.
+        for child_id in self.index.get_contains_children(target_id):
+            child = self.index.nodes.get(child_id)
+            if not child or child.kind != "Property":
+                continue
+            for th_edge in self.index.outgoing.get(child_id, {}).get("type_hint", []):
+                type_target_id = th_edge.target
+                type_target = self.index.nodes.get(type_target_id)
+                if not type_target or type_target.kind not in ("Class", "Interface", "Trait", "Enum"):
+                    continue
+                # Skip if already included via uses/extends edges
+                if type_target_id in local_visited or type_target_id in visited or type_target_id == target_id:
+                    continue
+                local_visited.add(type_target_id)
+
+                prop_name = child.name
+                if not prop_name.startswith("$"):
+                    prop_name = "$" + prop_name
+
+                prop_entry = ContextEntry(
+                    depth=depth,
+                    node_id=type_target_id,
+                    fqn=type_target.fqn,
+                    kind=type_target.kind,
+                    file=child.file,
+                    line=child.start_line,
+                    ref_type="property_type",
+                    property_name=prop_name,
+                    children=[],
+                )
+
+                # One level of recursive expansion (no infinite recursion)
+                if depth < max_depth:
+                    prop_entry.children = self._build_class_uses_recursive(
+                        type_target_id, depth + 1, max_depth, limit, visited | local_visited
+                    )
+
+                entries.append(prop_entry)
 
         # Sort by priority
         def sort_key(e):
@@ -5089,6 +5146,96 @@ class ContextQuery(Query[ContextResult]):
                         # Skip type_hint/parameter_type/return_type — these are subsumed
                         # by property_type entries or are constructor signature refs
                         continue
+
+        # --- Pass 2b: Transitive property_type discovery for parent interfaces (ISSUE-B) ---
+        # If the queried interface has no direct property_type consumers (no one types directly
+        # to it), discover consumers typed to child interfaces that call the parent's contract
+        # methods. This enables parent interfaces like BaseRepositoryInterface to show consumers
+        # like AuditService (typed to OrderRepositoryInterface) that call findAll().
+        if not property_type_entries and contract_method_names:
+            for iface_id, source_groups in all_source_groups:
+                if iface_id == start_id:
+                    continue  # Already processed in Pass 2
+                iface_node = self.index.nodes.get(iface_id)
+                for source_id, edges in source_groups.items():
+                    if source_id in visited_sources:
+                        continue
+                    source_node = self.index.nodes.get(source_id)
+                    if not source_node or source_node.kind == "File":
+                        continue
+                    for edge in edges:
+                        target_node = self.index.nodes.get(edge.target)
+                        if not target_node:
+                            continue
+                        file = edge.location.get("file") if edge.location else source_node.file
+                        line = edge.location.get("line") if edge.location else source_node.start_line
+                        call_node_id = find_call_for_usage(self.index, source_id, edge.target, file, line)
+                        if call_node_id:
+                            rt = get_reference_type_from_call(self.index, call_node_id)
+                        else:
+                            rt = _infer_reference_type(edge, target_node, self.index)
+                        if rt != "property_type":
+                            continue
+
+                        # Resolve property node
+                        prop_fqn = None
+                        prop_node = None
+                        if source_node.kind == "Property":
+                            prop_fqn = source_node.fqn
+                            prop_node = source_node
+                        elif source_node.kind in ("Method", "Function"):
+                            containing_class_id = self.index.get_contains_parent(source_id)
+                            if containing_class_id:
+                                for child_id in self.index.get_contains_children(containing_class_id):
+                                    child = self.index.nodes.get(child_id)
+                                    if child and child.kind == "Property":
+                                        for th_edge in self.index.outgoing[child_id].get("type_hint", []):
+                                            if th_edge.target == iface_id:
+                                                prop_fqn = child.fqn
+                                                prop_node = child
+                                                break
+                                        if prop_fqn:
+                                            break
+
+                        if not prop_fqn or not prop_node or prop_fqn in seen_property_type_props:
+                            continue
+
+                        # Contract relevance: consumer must call at least one
+                        # method from the queried interface's own contract.
+                        calls_contract = self._consumer_calls_contract_methods(
+                            prop_node.id, contract_method_names
+                        )
+                        if not calls_contract:
+                            continue
+
+                        seen_property_type_props.add(prop_fqn)
+                        visited_sources.add(source_id)
+
+                        via_fqn = iface_node.fqn if iface_node else None
+                        entry = ContextEntry(
+                            depth=1,
+                            node_id=prop_node.id,
+                            fqn=prop_fqn,
+                            kind="Property",
+                            file=prop_node.file,
+                            line=prop_node.start_line,
+                            ref_type="property_type",
+                            via=via_fqn,
+                            children=[],
+                        )
+
+                        # Depth 2: method calls through this property
+                        if max_depth >= 2:
+                            entry.children = self._build_interface_injection_point_calls(
+                                prop_node.id, iface_id, 2, max_depth
+                            )
+                            # Filter depth-2 children to only contract methods
+                            entry.children = [
+                                c for c in entry.children
+                                if self._entry_targets_contract_method(c, contract_method_names)
+                            ]
+
+                        property_type_entries.append(entry)
 
         # --- Pass 3: Discover property_type consumers typed to implementing classes (ISSUE-D) ---
         # Properties typed as an abstract/concrete implementor (not the interface itself)
@@ -5453,10 +5600,14 @@ class ContextQuery(Query[ContextResult]):
             target_node = self.index.nodes.get(target_id)
             if not target_node:
                 continue
+            # File reference points to source (where "extends X" is declared),
+            # not the target's definition location (ISSUE-F fix).
+            ext_file = edge.location.get("file") if edge.location else start_node.file
+            ext_line = edge.location.get("line") if edge.location else start_node.start_line
             target_info[target_id] = {
                 "ref_type": "extends",
-                "file": target_node.file,
-                "line": target_node.start_line,
+                "file": ext_file,
+                "line": ext_line,
                 "node": target_node,
             }
 
