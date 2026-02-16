@@ -170,6 +170,8 @@ class ContextEntry:
     sites: Optional[list] = None  # Multi-site dedup [{"method": ..., "line": ...}, ...]
     via: Optional[str] = None  # FQN of interface for via-interface labels
     property_name: Optional[str] = None  # "$orderRepository" for property_type entries
+    access_count: Optional[int] = None  # Total accesses for property_access groups
+    method_count: Optional[int] = None  # Distinct methods for property_access groups
 
 
 @dataclass

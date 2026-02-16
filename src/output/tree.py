@@ -399,8 +399,8 @@ def print_context_tree(result: ContextResult, console: Console):
                 # refType tag (when no member_ref reference_type already shown)
                 if entry.ref_type and not (entry.member_ref and entry.member_ref.reference_type):
                     label += f" [cyan]\\[{entry.ref_type}][/cyan]"
-                # callee display
-                if entry.callee and not (entry.member_ref and entry.member_ref.target_name):
+                # callee display (only for method_call)
+                if entry.callee and entry.ref_type == "method_call" and not (entry.member_ref and entry.member_ref.target_name):
                     label += f" [bold yellow]->[/bold yellow] [yellow]{entry.callee}[/yellow]"
                 # via label
                 if entry.via:
@@ -585,9 +585,11 @@ def context_tree_to_dict(result: ContextResult) -> dict:
                 args = {}
                 for a in entry.arguments:
                     key = a.param_fqn or a.param_name or f"arg[{a.position}]"
-                    # Shorten param_fqn: keep only method().$param part
+                    # Shorten param_fqn: Class::$param (short class name + member)
                     if a.param_fqn and "::" in a.param_fqn:
-                        key = a.param_fqn.rsplit("::", 1)[-1]
+                        ns_class, member = a.param_fqn.rsplit("::", 1)
+                        short_class = ns_class.rsplit("\\", 1)[-1] if "\\" in ns_class else ns_class
+                        key = f"{short_class}::{member}"
                     val = a.value_expr or "?"
                     args[key] = val
                 if args:
@@ -618,8 +620,8 @@ def context_tree_to_dict(result: ContextResult) -> dict:
         # context-final ISSUE-G: New flat entry fields for class/interface/property context
         if entry.ref_type:
             d["refType"] = entry.ref_type
-        # Fix 3: callee only for method_call and property_access ref types
-        if entry.callee and entry.ref_type in ("method_call", "property_access"):
+        # callee only for method_call ref type
+        if entry.callee and entry.ref_type == "method_call":
             d["callee"] = entry.callee
         if entry.on:
             d["on"] = entry.on
@@ -633,6 +635,10 @@ def context_tree_to_dict(result: ContextResult) -> dict:
             d["via"] = entry.via
         if entry.property_name:
             d["property"] = entry.property_name
+        if entry.access_count is not None:
+            d["accessCount"] = entry.access_count
+        if entry.method_count is not None:
+            d["methodCount"] = entry.method_count
         return d
 
     target_dict = {

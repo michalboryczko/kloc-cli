@@ -235,6 +235,18 @@ def find_call_for_usage(index: "SoTIndex", source_id: str, target_id: str, file:
                 if _call_matches_target(index, call_id, target_id):
                     return call_id
 
+    # Constructor fallback without location: if target is a Class, search the
+    # source's Call children for constructor calls whose callee's containing
+    # class matches the target. This handles cases where get_calls_to(Class)
+    # misses constructor calls (which target __construct, not the Class node).
+    target_node = index.nodes.get(target_id)
+    if target_node and target_node.kind in ("Class", "Interface", "Trait", "Enum"):
+        for call_id in call_children:
+            call_node = index.nodes.get(call_id)
+            if call_node and call_node.call_kind == "constructor":
+                if _call_matches_target(index, call_id, target_id):
+                    return call_id
+
     return None
 
 
@@ -664,6 +676,10 @@ class ContextQuery(Query[ContextResult]):
                 info.properties.append(prop_dict)
 
             elif child.kind == "Method":
+                # Skip __construct — implied by promoted properties
+                if child.name == "__construct":
+                    continue
+
                 method_dict: dict = {"name": child.name}
                 if child.signature:
                     method_dict["signature"] = child.signature
@@ -3485,6 +3501,8 @@ class ContextQuery(Query[ContextResult]):
                 line=None,
                 ref_type="property_access",
                 children=method_children,
+                access_count=total_accesses,
+                method_count=total_methods,
             )
             property_access_entries.append(prop_entry)
 
@@ -4149,6 +4167,22 @@ class ContextQuery(Query[ContextResult]):
                     "property_name": property_name,
                     "node": resolved_target,
                 }
+
+        # Ensure type_hint targets (property_type, parameter_type, return_type)
+        # that were not reached via "uses" edges are still included.
+        for tid, th_info in type_hint_info.items():
+            if tid in target_info or tid == start_id:
+                continue
+            target_node = self.index.nodes.get(tid)
+            if not target_node or target_node.kind not in ("Class", "Interface", "Trait", "Enum"):
+                continue
+            target_info[tid] = {
+                "ref_type": th_info["ref_type"],
+                "file": th_info["file"] or target_node.file,
+                "line": th_info["line"] if th_info["line"] is not None else target_node.start_line,
+                "property_name": th_info.get("property_name"),
+                "node": target_node,
+            }
 
         # Build entries
         entries: list[ContextEntry] = []
