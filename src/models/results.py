@@ -162,6 +162,14 @@ class ContextEntry:
     source_call: Optional["ContextEntry"] = None  # Nested call for Kind 1 entries
     # ISSUE-E: Cross-method boundary crossing indicator
     crossed_from: Optional[str] = None  # FQN of the parameter crossed from
+    # context-final ISSUE-G: New flat entry fields for class/interface/property context
+    ref_type: Optional[str] = None  # "instantiation", "extends", "implements", "property_type", etc.
+    callee: Optional[str] = None  # "save()" for method_call entries
+    on: Optional[str] = None  # "$this->orderRepository" receiver expression
+    on_kind: Optional[str] = None  # "property", "param", "local", "self"
+    sites: Optional[list] = None  # Multi-site dedup [{"method": ..., "line": ...}, ...]
+    via: Optional[str] = None  # FQN of interface for via-interface labels
+    property_name: Optional[str] = None  # "$orderRepository" for property_type entries
 
 
 @dataclass
@@ -273,3 +281,5 @@ class DefinitionInfo:
     value_kind: Optional[str] = None      # "local", "parameter", "result", "literal", "constant"
     type_info: Optional[dict] = None      # {"fqn": ..., "name": ...}
     source: Optional[dict] = None         # {"call_fqn": ..., "method_fqn": ..., "method_name": ..., ...}
+    # context-final ISSUE-G: Constructor dependencies for class definition
+    constructor_deps: list[dict] = field(default_factory=list)  # [{"name": "$x", "type": "Foo"}, ...]

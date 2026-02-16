@@ -434,6 +434,20 @@ def _infer_reference_type(edge: EdgeData, target_node: Optional[NodeData], index
                             return "parameter_type"
                         if has_return_type_hint:
                             return "return_type"
+                        # Constructor promotion fix: when source is __construct()
+                        # and no Argument child matched, check the parent class's
+                        # Property children for a type_hint edge to the target.
+                        # Promoted constructor params create Property nodes with
+                        # type_hint edges but no Argument nodes.
+                        if source_node.name == "__construct":
+                            containing_class_id = index.get_contains_parent(method_id)
+                            if containing_class_id:
+                                for child_id in index.get_contains_children(containing_class_id):
+                                    child = index.nodes.get(child_id)
+                                    if child and child.kind == "Property":
+                                        for th_edge in index.outgoing[child_id].get("type_hint", []):
+                                            if th_edge.target == target_id:
+                                                return "property_type"
                     if source_node.kind in ("Class", "Interface", "Trait", "Enum"):
                         # Class-level query: check if any Property child has a
                         # type_hint edge to the target (property_type).

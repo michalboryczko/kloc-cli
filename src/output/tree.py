@@ -249,26 +249,52 @@ def print_definition_section(result: ContextResult, console: Console):
         type_name = defn.return_type.get("name", defn.return_type.get("fqn", "?"))
         console.print(f"  [dim]Type:[/dim] {type_name}")
 
+    # context-final ISSUE-G: Show constructor dependencies
+    if defn.constructor_deps:
+        console.print("  [dim]Constructor deps:[/dim]")
+        for dep in defn.constructor_deps:
+            dep_name = dep.get("name", "?")
+            dep_type = dep.get("type")
+            if dep_type:
+                console.print(f"    {dep_name}: {dep_type}")
+            else:
+                console.print(f"    {dep_name}")
+
     # Show properties for classes
     if defn.properties:
         console.print("  [dim]Properties:[/dim]")
         for prop in defn.properties:
             prop_name = prop.get("name", "?")
             prop_type = prop.get("type")
+            parts = []
+            # context-final ISSUE-G: Show property metadata
+            visibility = prop.get("visibility")
+            if visibility:
+                parts.append(visibility)
+            if prop.get("readonly"):
+                parts.append("readonly")
+            if prop.get("static"):
+                parts.append("static")
+            if prop.get("promoted"):
+                parts.append("promoted")
+            prefix = f"[dim]{' '.join(parts)}[/dim] " if parts else ""
             if prop_type:
-                console.print(f"    {prop_name}: {prop_type}")
+                console.print(f"    {prefix}{prop_name}: {prop_type}")
             else:
-                console.print(f"    {prop_name}")
+                console.print(f"    {prefix}{prop_name}")
 
     # Show methods for classes
     if defn.methods:
         console.print("  [dim]Methods:[/dim]")
         for method in defn.methods:
             sig = method.get("signature")
+            # context-final ISSUE-G: Show method tags
+            tags = method.get("tags", [])
+            tag_str = f" [cyan]{''.join(f'[{t}]' for t in tags)}[/cyan]" if tags else ""
             if sig:
-                console.print(f"    {sig}")
+                console.print(f"    {sig}{tag_str}")
             else:
-                console.print(f"    {method.get('name', '?')}()")
+                console.print(f"    {method.get('name', '?')}(){tag_str}")
 
     # Show inheritance
     if defn.extends:
@@ -366,12 +392,38 @@ def print_context_tree(result: ContextResult, console: Console):
                     # Add reference type indicator (escape brackets for Rich)
                     if entry.member_ref.reference_type:
                         label += f" [cyan]\\[{entry.member_ref.reference_type}][/cyan]"
-                if entry.file and entry.line is not None:
+                # context-final ISSUE-G: Render new flat entry fields
+                # Property arrow for property_type entries
+                if entry.property_name and not (entry.member_ref and entry.member_ref.target_name):
+                    label += f" [bold yellow]->[/bold yellow] [yellow]{entry.property_name}[/yellow]"
+                # refType tag (when no member_ref reference_type already shown)
+                if entry.ref_type and not (entry.member_ref and entry.member_ref.reference_type):
+                    label += f" [cyan]\\[{entry.ref_type}][/cyan]"
+                # callee display
+                if entry.callee and not (entry.member_ref and entry.member_ref.target_name):
+                    label += f" [bold yellow]->[/bold yellow] [yellow]{entry.callee}[/yellow]"
+                # via label
+                if entry.via:
+                    via_short = entry.via.rsplit("\\", 1)[-1] if "\\" in entry.via else entry.via
+                    label += f" [magenta]<- via {via_short}[/magenta]"
+                # sites display (multi-site replaces single line)
+                if entry.sites:
+                    count = len(entry.sites)
+                    label += f" [dim](x{count})[/dim]"
+                    if entry.file:
+                        label += f" [dim]({entry.file})[/dim]"
+                elif entry.file and entry.line is not None:
                     label += f" [dim]({entry.file}:{entry.line + 1})[/dim]"
                 elif entry.file:
                     label += f" [dim]({entry.file})[/dim]"
+                # on/onKind display for new flat fields
+                if entry.on and not (entry.member_ref and entry.member_ref.access_chain):
+                    on_text = entry.on
+                    if entry.on_kind:
+                        on_text += f" [cyan]\\[{entry.on_kind}][/cyan]"
+                    label += f"\n        [dim]on:[/dim] [green]{on_text}[/green]"
                 # Add access chain on a new line if present
-                if entry.member_ref and entry.member_ref.access_chain:
+                elif entry.member_ref and entry.member_ref.access_chain:
                     chain_text = entry.member_ref.access_chain
                     # R4: Include property FQN in parentheses after access chain if available
                     if entry.member_ref.access_chain_symbol:
@@ -534,6 +586,23 @@ def context_tree_to_dict(result: ContextResult) -> dict:
         # ISSUE-E: Cross-method boundary crossing indicator
         if entry.crossed_from:
             d["crossed_from"] = entry.crossed_from
+        # context-final ISSUE-G: New flat entry fields for class/interface/property context
+        if entry.ref_type:
+            d["refType"] = entry.ref_type
+        if entry.callee:
+            d["callee"] = entry.callee
+        if entry.on:
+            d["on"] = entry.on
+        if entry.on_kind:
+            d["onKind"] = entry.on_kind
+        if entry.sites:
+            d["sites"] = entry.sites
+            # When sites is present, omit line
+            d.pop("line", None)
+        if entry.via:
+            d["via"] = entry.via
+        if entry.property_name:
+            d["property"] = entry.property_name
         return d
 
     target_dict = {
@@ -585,6 +654,9 @@ def context_tree_to_dict(result: ContextResult) -> dict:
             defn_dict["type"] = defn.type_info
         if defn.source:
             defn_dict["source"] = defn.source
+        # context-final ISSUE-G: Constructor dependencies
+        if defn.constructor_deps:
+            defn_dict["constructor_deps"] = defn.constructor_deps
         d["definition"] = defn_dict
 
     return d
