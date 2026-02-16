@@ -1559,6 +1559,25 @@ class ContextQuery(Query[ContextResult]):
             return promoted[position].name
         return None
 
+    def _build_external_call_fqn(self, call_node_id: str, call_node) -> str:
+        """Build a display FQN for an external call (callee not in graph).
+
+        Uses the receiver's type_of to get the class/interface name, then
+        appends the call name. Falls back to just the call name.
+        """
+        call_name = call_node.name or "?"
+        # Try to get receiver type for a qualified FQN
+        recv_id = self.index.get_receiver(call_node_id)
+        if recv_id:
+            recv_node = self.index.nodes.get(recv_id)
+            if recv_node:
+                type_ids = self.index.get_type_of_all(recv_id)
+                for tid in type_ids:
+                    type_node = self.index.nodes.get(tid)
+                    if type_node:
+                        return f"{type_node.fqn}::{call_name}"
+        return call_name
+
     def _find_result_var(self, call_node_id: str) -> Optional[str]:
         """Find the local variable name that receives this call's result.
 
@@ -1956,8 +1975,99 @@ class ContextQuery(Query[ContextResult]):
                 break
 
             target_id = self.index.get_call_target(child_id)
+
+            # External call (callee has no node in graph, e.g., vendor method)
             if not target_id:
+                # Use the Call node's own data to build the entry
+                count[0] += 1
+                call_line = child.range.get("start_line") if child.range else None
+                ac, acs, ok, of, ol = self._resolve_receiver_identity(child_id)
+                arguments = self._get_argument_info(child_id)
+                # Derive FQN from receiver type + call name
+                ext_fqn = self._build_external_call_fqn(child_id, child)
+                reference_type = get_reference_type_from_call(self.index, child_id)
+
+                member_ref = MemberRef(
+                    target_name="",
+                    target_fqn=ext_fqn,
+                    target_kind=child.call_kind or "method",
+                    file=child.file,
+                    line=call_line,
+                    reference_type=reference_type,
+                    access_chain=ac,
+                    access_chain_symbol=acs,
+                    on_kind=ok,
+                    on_file=of,
+                    on_line=ol,
+                )
+
+                local_value = self._find_local_value_for_call(child_id)
+                if local_value:
+                    var_type = None
+                    type_of_edges = self.index.outgoing[local_value.id].get("type_of", [])
+                    if type_of_edges:
+                        type_node = self.index.nodes.get(type_of_edges[0].target)
+                        if type_node:
+                            var_type = type_node.name
+
+                    source_call_entry = ContextEntry(
+                        depth=depth,
+                        node_id=child_id,
+                        fqn=ext_fqn,
+                        kind=child.call_kind or "Method",
+                        file=child.file,
+                        line=call_line,
+                        signature=None,
+                        children=[],
+                        implementations=[],
+                        member_ref=member_ref,
+                        arguments=arguments,
+                        result_var=None,
+                        entry_type="call",
+                    )
+                    var_symbol = local_value.fqn
+                    var_line = local_value.range.get("start_line") if local_value.range else call_line
+
+                    entry = ContextEntry(
+                        depth=depth,
+                        node_id=local_value.id,
+                        fqn=local_value.fqn,
+                        kind="Value",
+                        file=child.file,
+                        line=var_line,
+                        signature=None,
+                        children=[],
+                        implementations=[],
+                        member_ref=None,
+                        arguments=[],
+                        result_var=None,
+                        entry_type="local_variable",
+                        variable_name=local_value.name,
+                        variable_symbol=var_symbol,
+                        variable_type=var_type,
+                        source_call=source_call_entry,
+                    )
+                else:
+                    result_var = self._find_result_var(child_id)
+                    entry = ContextEntry(
+                        depth=depth,
+                        node_id=child_id,
+                        fqn=ext_fqn,
+                        kind=child.call_kind or "Method",
+                        file=child.file,
+                        line=call_line,
+                        signature=None,
+                        children=[],
+                        implementations=[],
+                        member_ref=member_ref,
+                        arguments=arguments,
+                        result_var=result_var,
+                        entry_type="call",
+                    )
+                # External calls cannot recurse (no target method to expand)
+                entries.append(entry)
                 continue
+
             if target_id in local_visited:
                 continue
             local_visited.add(target_id)
