@@ -502,6 +502,12 @@ def context_tree_to_dict(result: ContextResult) -> dict:
     """Convert context result to JSON-serializable dict with nested tree structure."""
     from ..models import ContextEntry
 
+    # Determine if target is class/interface/property (class-level context mode).
+    # In this mode, member_ref, signature (except override/inherited), and
+    # crossed_from are stripped from ALL entries at ALL depths.
+    target_kind = result.target.kind if result.target else None
+    class_level_context = target_kind in ("Class", "Interface", "Trait", "Enum", "Property")
+
     def _argument_to_dict(a) -> dict:
         d = {
             "position": a.position,
@@ -529,13 +535,16 @@ def context_tree_to_dict(result: ContextResult) -> dict:
             "children": [context_entry_to_dict(c) for c in entry.children],
         }
         # Include signature if present (for methods/functions)
-        # Skip signature for new flat-field entries (class/interface/property context)
-        # — signature is only relevant for method context backward compat
-        if entry.signature and not entry.ref_type:
-            d["signature"] = entry.signature
-        # For override/inherited entries, include signature (spec requires it)
-        elif entry.signature and entry.ref_type in ("override", "inherited"):
-            d["signature"] = entry.signature
+        if class_level_context:
+            # In class-level context, only include signature for override/inherited entries
+            if entry.signature and entry.ref_type in ("override", "inherited"):
+                d["signature"] = entry.signature
+        else:
+            # Method context backward compat: include signature when no ref_type
+            if entry.signature and not entry.ref_type:
+                d["signature"] = entry.signature
+            elif entry.signature and entry.ref_type in ("override", "inherited"):
+                d["signature"] = entry.signature
         # Include implementations if present (USES direction)
         if entry.implementations:
             d["implementations"] = [context_entry_to_dict(impl) for impl in entry.implementations]
@@ -543,9 +552,8 @@ def context_tree_to_dict(result: ContextResult) -> dict:
         if entry.via_interface:
             d["via_interface"] = True
         # Include member reference (what specific member is used)
-        # Skip member_ref for new flat-field entries (class/interface/property context)
-        # — the relevant data is already in flat fields (refType, callee, on, onKind)
-        if entry.member_ref and not entry.ref_type:
+        # In class-level context mode, suppress member_ref at ALL depths
+        if not class_level_context and entry.member_ref and not entry.ref_type:
             member_ref_dict = {
                 "target_name": entry.member_ref.target_name,
                 "target_fqn": entry.member_ref.target_fqn,
@@ -572,10 +580,23 @@ def context_tree_to_dict(result: ContextResult) -> dict:
             d["member_ref"] = member_ref_dict
         # Include arguments if present
         if entry.arguments:
-            d["arguments"] = [
-                _argument_to_dict(a)
-                for a in entry.arguments
-            ]
+            if entry.ref_type or class_level_context:
+                # Flat args format for class/interface/property context
+                args = {}
+                for a in entry.arguments:
+                    key = a.param_fqn or a.param_name or f"arg[{a.position}]"
+                    # Shorten param_fqn: keep only method().$param part
+                    if a.param_fqn and "::" in a.param_fqn:
+                        key = a.param_fqn.rsplit("::", 1)[-1]
+                    val = a.value_expr or "?"
+                    args[key] = val
+                if args:
+                    d["args"] = args
+            else:
+                d["arguments"] = [
+                    _argument_to_dict(a)
+                    for a in entry.arguments
+                ]
         # Include result_var if present
         if entry.result_var:
             d["result_var"] = entry.result_var
@@ -591,12 +612,14 @@ def context_tree_to_dict(result: ContextResult) -> dict:
         if entry.source_call:
             d["source_call"] = context_entry_to_dict(entry.source_call)
         # ISSUE-E: Cross-method boundary crossing indicator
-        if entry.crossed_from:
+        # In class-level context mode, suppress crossed_from at ALL depths
+        if entry.crossed_from and not class_level_context:
             d["crossed_from"] = entry.crossed_from
         # context-final ISSUE-G: New flat entry fields for class/interface/property context
         if entry.ref_type:
             d["refType"] = entry.ref_type
-        if entry.callee:
+        # Fix 3: callee only for method_call and property_access ref types
+        if entry.callee and entry.ref_type in ("method_call", "property_access"):
             d["callee"] = entry.callee
         if entry.on:
             d["on"] = entry.on

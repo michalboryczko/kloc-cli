@@ -691,6 +691,16 @@ class ContextQuery(Query[ContextResult]):
                     method_dict["tags"] = tags
                 info.methods.append(method_dict)
 
+        # Sort methods: override first, then inherited, then regular
+        def _method_sort_key(m):
+            tags = m.get("tags", [])
+            if "override" in tags:
+                return 0
+            if "inherited" in tags:
+                return 1
+            return 2
+        info.methods.sort(key=_method_sort_key)
+
         # Constructor deps: promoted parameters with their types
         for child_id in children:
             child = self.index.nodes.get(child_id)
@@ -1445,6 +1455,26 @@ class ContextQuery(Query[ContextResult]):
                     on_line=ol,
                 )
 
+            # Build flat fields for class-level context compatibility
+            flat_ref_type = None
+            flat_callee = None
+            flat_on = None
+            flat_on_kind = None
+            if consumer_target:
+                flat_ref_type = get_reference_type_from_call(self.index, consumer_call_id)
+                if consumer_target.kind == "Method":
+                    flat_callee = consumer_target.name + "()"
+                elif consumer_target.kind == "Property":
+                    flat_callee = consumer_target.name if consumer_target.name.startswith("$") else "$" + consumer_target.name
+                if member_ref:
+                    flat_on = member_ref.access_chain
+                    flat_on_kind = member_ref.on_kind
+                    # Detect property-based receiver (on_kind None but access_chain_symbol is a Property)
+                    if flat_on_kind is None and member_ref.access_chain_symbol:
+                        sym_nodes = self.index.resolve_symbol(member_ref.access_chain_symbol)
+                        if sym_nodes and sym_nodes[0].kind == "Property":
+                            flat_on_kind = "property"
+
             entry = ContextEntry(
                 depth=depth,
                 node_id=consumer_target_id or consumer_call_id,
@@ -1456,6 +1486,10 @@ class ContextQuery(Query[ContextResult]):
                 children=[],
                 member_ref=member_ref,
                 arguments=arguments,
+                ref_type=flat_ref_type,
+                callee=flat_callee,
+                on=flat_on,
+                on_kind=flat_on_kind,
             )
 
             # Depth expansion: trace forward into callee body
@@ -1511,6 +1545,7 @@ class ContextQuery(Query[ContextResult]):
 
             reference_type = get_reference_type_from_call(self.index, access_call_id)
             ac, acs, ok, of, ol = self._resolve_receiver_identity(access_call_id)
+            arguments = self._get_argument_info(access_call_id)
 
             member_ref = MemberRef(
                 target_name=self._member_display_name(target_node) if target_node else "?",
@@ -1526,6 +1561,20 @@ class ContextQuery(Query[ContextResult]):
                 on_line=ol,
             )
 
+            # Build flat fields for class-level context compatibility
+            flat_callee = None
+            if target_node:
+                if target_node.kind == "Method":
+                    flat_callee = target_node.name + "()"
+                elif target_node.kind == "Property":
+                    flat_callee = target_node.name if target_node.name.startswith("$") else "$" + target_node.name
+            # Detect property-based receiver
+            flat_on_kind = ok
+            if flat_on_kind is None and acs:
+                sym_nodes = self.index.resolve_symbol(acs)
+                if sym_nodes and sym_nodes[0].kind == "Property":
+                    flat_on_kind = "property"
+
             entry = ContextEntry(
                 depth=depth,
                 node_id=target_id or access_call_id,
@@ -1535,6 +1584,11 @@ class ContextQuery(Query[ContextResult]):
                 line=call_line,
                 children=[],
                 member_ref=member_ref,
+                arguments=arguments,
+                ref_type=reference_type,
+                callee=flat_callee,
+                on=ac,
+                on_kind=flat_on_kind,
             )
             count += 1
             entries.append(entry)
@@ -1586,6 +1640,26 @@ class ContextQuery(Query[ContextResult]):
                     on_line=ol,
                 )
 
+            # Build flat fields for class-level context compatibility
+            flat_ref_type3 = None
+            flat_callee3 = None
+            flat_on3 = None
+            flat_on_kind3 = None
+            if consumer_target:
+                flat_ref_type3 = get_reference_type_from_call(self.index, consumer_call_id)
+                if consumer_target.kind == "Method":
+                    flat_callee3 = consumer_target.name + "()"
+                elif consumer_target.kind == "Property":
+                    flat_callee3 = consumer_target.name if consumer_target.name.startswith("$") else "$" + consumer_target.name
+                if member_ref:
+                    flat_on3 = member_ref.access_chain
+                    flat_on_kind3 = member_ref.on_kind
+                    # Detect property-based receiver
+                    if flat_on_kind3 is None and member_ref.access_chain_symbol:
+                        sym_nodes = self.index.resolve_symbol(member_ref.access_chain_symbol)
+                        if sym_nodes and sym_nodes[0].kind == "Property":
+                            flat_on_kind3 = "property"
+
             entry = ContextEntry(
                 depth=depth,
                 node_id=consumer_target_id or consumer_call_id,
@@ -1597,6 +1671,10 @@ class ContextQuery(Query[ContextResult]):
                 children=[],
                 member_ref=member_ref,
                 arguments=arguments,
+                ref_type=flat_ref_type3,
+                callee=flat_callee3,
+                on=flat_on3,
+                on_kind=flat_on_kind3,
             )
 
             # ISSUE-E: Cross-method USED BY — cross into callee via parameter FQN
@@ -3577,15 +3655,17 @@ class ContextQuery(Query[ContextResult]):
                     ac, acs, ok, of, ol = self._resolve_receiver_identity(call_node_id)
                     on_expr = ac
                     on_kind = ok
+                    # Detect "property" from access chain pattern ($this->prop)
+                    if on_kind is None and on_expr and on_expr.startswith("$this->"):
+                        on_kind = "property"
 
                 display_fqn = containing_method.fqn if containing_method else source_node.fqn
                 if containing_method and containing_method.kind == "Method":
-                    # Show as ClassName::method() -> callee() [method_call]
-                    class_part = display_fqn.split("::")[0].split("\\")[-1] if "::" in display_fqn else ""
-                    method_part = display_fqn.split("::")[-1] if "::" in display_fqn else display_fqn
-                    if not method_part.endswith("()"):
-                        method_part += "()"
-                    display_fqn = f"{class_part}::{method_part}" if class_part else method_part
+                    if not display_fqn.endswith("()"):
+                        display_fqn += "()"
+
+                # Use "caller" refType for depth 3+ entries (upstream callers)
+                entry_ref_type = "caller" if depth >= 3 else "method_call"
 
                 entry = ContextEntry(
                     depth=depth,
@@ -3594,8 +3674,8 @@ class ContextQuery(Query[ContextResult]):
                     kind=containing_method.kind if containing_method else source_node.kind,
                     file=file,
                     line=line,
-                    ref_type="method_call",
-                    callee=callee_name,
+                    ref_type=entry_ref_type,
+                    callee=callee_name if entry_ref_type != "caller" else None,
                     on=on_expr,
                     on_kind=on_kind,
                     children=[],
@@ -4874,13 +4954,15 @@ class ContextQuery(Query[ContextResult]):
 
             entries.append(entry)
 
-        # Sort: extends first, then parameter_type/return_type, then implements
+        # Sort: extends first, then implements, then parameter_type/return_type
         uses_priority = {
             "extends": 0,
-            "parameter_type": 1,
-            "return_type": 1,
-            "implements": 2,
-            "type_hint": 3,
+            "implements": 1,
+            "property_type": 2,
+            "parameter_type": 3,
+            "return_type": 3,
+            "instantiation": 4,
+            "type_hint": 5,
         }
 
         def sort_key(e):
