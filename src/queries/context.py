@@ -1326,7 +1326,8 @@ class ContextQuery(Query[ContextResult]):
 
     def _build_value_consumer_chain(
         self, value_id: str, depth: int, max_depth: int, limit: int,
-        visited: set | None = None
+        visited: set | None = None,
+        crossing_count: int = 0, max_crossings: int = 3
     ) -> list[ContextEntry]:
         """Build consumer chain for a Value node (USED BY section).
 
@@ -1538,7 +1539,8 @@ class ContextQuery(Query[ContextResult]):
                     # ISSUE-E: Cross-method USED BY — cross into callee via parameter FQN
                     self._cross_into_callee(
                         consumer_call_id, consumer_target_id, consumer_target,
-                        entry, depth, max_depth, limit, visited
+                        entry, depth, max_depth, limit, visited,
+                        crossing_count=crossing_count, max_crossings=max_crossings
                     )
 
             count += 1
@@ -1698,7 +1700,8 @@ class ContextQuery(Query[ContextResult]):
                 if consumer_target.kind in ("Method", "Function"):
                     self._cross_into_callee(
                         consumer_call_id, consumer_target_id, consumer_target,
-                        entry, depth, max_depth, limit, visited
+                        entry, depth, max_depth, limit, visited,
+                        crossing_count=crossing_count, max_crossings=max_crossings
                     )
 
             count += 1
@@ -1712,7 +1715,7 @@ class ContextQuery(Query[ContextResult]):
     def _cross_into_callee(
         self, call_node_id: str, callee_id: str, callee_node,
         entry: "ContextEntry", depth: int, max_depth: int, limit: int,
-        visited: set
+        visited: set, crossing_count: int = 0, max_crossings: int = 3
     ) -> None:
         """Cross method boundary from caller into callee for USED BY tracing.
 
@@ -1731,6 +1734,8 @@ class ContextQuery(Query[ContextResult]):
             max_depth: Maximum depth.
             limit: Maximum entries.
             visited: Visited Value IDs for cycle detection.
+            crossing_count: Number of return crossings so far in this chain.
+            max_crossings: Maximum return crossings allowed per chain.
         """
         # Cross into callee via argument parameter FQNs
         arg_edges = self.index.get_arguments(call_node_id)
@@ -1743,7 +1748,8 @@ class ContextQuery(Query[ContextResult]):
                 if pm.kind == "Value" and pm.value_kind == "parameter":
                     if pm.id not in visited:
                         child_entries = self._build_value_consumer_chain(
-                            pm.id, depth + 1, max_depth, limit, visited
+                            pm.id, depth + 1, max_depth, limit, visited,
+                            crossing_count=crossing_count, max_crossings=max_crossings
                         )
                         for ce in child_entries:
                             if not ce.crossed_from:
@@ -1755,8 +1761,126 @@ class ContextQuery(Query[ContextResult]):
         local_value = self._find_local_value_for_call(call_node_id)
         if local_value and local_value.id not in visited:
             return_entries = self._build_value_consumer_chain(
-                local_value.id, depth + 1, max_depth, limit, visited
+                local_value.id, depth + 1, max_depth, limit, visited,
+                crossing_count=crossing_count, max_crossings=max_crossings
             )
+            entry.children.extend(return_entries)
+        else:
+            # No local assignment — check if return expression, cross into callers
+            self._cross_into_callers_via_return(
+                call_node_id, entry, depth, max_depth, limit, visited,
+                crossing_count=crossing_count, max_crossings=max_crossings
+            )
+
+    def _get_type_of(self, node_id: str) -> Optional[str]:
+        """Get the type_of target node ID for a Value node."""
+        for edge in self.index.outgoing[node_id].get("type_of", []):
+            return edge.target
+        return None
+
+    def _cross_into_callers_via_return(
+        self, call_node_id: str, entry: "ContextEntry",
+        depth: int, max_depth: int, limit: int, visited: set,
+        crossing_count: int = 0, max_crossings: int = 3
+    ) -> None:
+        """Cross from callee return back into caller scope via return value.
+
+        When a Value is consumed by a Call (e.g., new OrderOutput(...)) that is
+        the return expression of a method, and there is no local variable assigned
+        from the result in the current scope, this traces the return value into
+        caller scopes where the result IS assigned to a local variable.
+
+        Uses type matching as a guard: the consumer result's type_of must match
+        the caller local's type_of to prevent false positives.
+
+        Safety guards (ISSUE-C):
+        - Depth budget: depth >= max_depth stops expansion
+        - Crossing limit: crossing_count >= max_crossings stops further crossings
+        - Method-level cycle prevention: visited set tracks method IDs to prevent loops
+        - Fan-out cap: callers capped at limit per crossing point
+
+        Args:
+            call_node_id: The consumer Call node ID (e.g., the instantiation).
+            entry: The ContextEntry to attach children to.
+            depth: Current depth level.
+            max_depth: Maximum depth.
+            limit: Maximum entries.
+            visited: Visited Value IDs and method-crossing keys for cycle detection.
+            crossing_count: Number of return crossings so far in this chain.
+            max_crossings: Maximum number of return crossings allowed per chain.
+        """
+        if depth >= max_depth:
+            return
+
+        # ISSUE-C Guard: Crossing limit
+        if crossing_count >= max_crossings:
+            return
+
+        # Step 1: Get produced Value(result) from consumer Call
+        result_id = self.index.get_produces(call_node_id)
+        if not result_id:
+            return
+
+        # Step 2: Verify no Value(local) assigned from it (inline return check)
+        for edge in self.index.incoming[result_id].get("assigned_from", []):
+            source_node = self.index.nodes.get(edge.source)
+            if source_node and source_node.kind == "Value" and source_node.value_kind == "local":
+                return  # Has a local assignment, not an inline return
+
+        # Step 3: TYPE GUARD — get consumer result type_of
+        consumer_type_id = self._get_type_of(result_id)
+        if not consumer_type_id:
+            return  # Conservative: no type info, don't cross
+
+        # Step 4: Find containing method
+        containing_method_id = self.index.get_contains_parent(call_node_id)
+        if not containing_method_id:
+            return
+        containing_method = self.index.nodes.get(containing_method_id)
+        if not containing_method or containing_method.kind not in ("Method", "Function"):
+            return
+
+        # ISSUE-C Guard: Method-level cycle prevention
+        method_key = f"return_crossing:{containing_method_id}"
+        if method_key in visited:
+            return
+        # Note: Don't add method_key to visited yet — only after finding a type-matching caller.
+        # Adding it eagerly would block the correct Call (e.g., new OrderOutput) if an earlier
+        # Call in the same method (e.g., new OrderCreatedMessage) fails the type guard first.
+
+        # Step 5: Find callers of the containing method
+        caller_call_ids = self.index.get_calls_to(containing_method_id)
+
+        # ISSUE-C Guard: Fan-out cap — limit callers processed per crossing point
+        for caller_call_id in caller_call_ids[:limit]:
+            caller_local = self._find_local_value_for_call(caller_call_id)
+            if not caller_local or caller_local.id in visited:
+                continue
+
+            # Step 7: TYPE GUARD — caller local type must match consumer result type
+            caller_type_id = self._get_type_of(caller_local.id)
+            if caller_type_id != consumer_type_id:
+                continue  # Type mismatch, skip
+
+            # Mark method as visited NOW — we found a valid match, prevent re-entry
+            visited.add(method_key)
+
+            # Step 8: Continue tracing from caller's local (increment crossing_count)
+            return_entries = self._build_value_consumer_chain(
+                caller_local.id, depth + 1, max_depth, limit, visited,
+                crossing_count=crossing_count + 1, max_crossings=max_crossings
+            )
+
+            # ISSUE-D: Set crossed_from on first child entries to show crossing notation
+            # Find the caller's containing method to show "crosses into CallerMethod()"
+            caller_method_id = self.index.get_contains_parent(caller_call_id)
+            caller_method_node = self.index.nodes.get(caller_method_id) if caller_method_id else None
+            if caller_method_node and caller_method_node.kind in ("Method", "Function"):
+                caller_method_fqn = caller_method_node.fqn
+                for child_entry in return_entries:
+                    if not child_entry.crossed_from:
+                        child_entry.crossed_from = caller_method_fqn
+
             entry.children.extend(return_entries)
 
     def _resolve_receiver_identity(self, call_node_id: str) -> tuple[
