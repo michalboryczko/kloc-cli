@@ -529,7 +529,12 @@ def context_tree_to_dict(result: ContextResult) -> dict:
             "children": [context_entry_to_dict(c) for c in entry.children],
         }
         # Include signature if present (for methods/functions)
-        if entry.signature:
+        # Skip signature for new flat-field entries (class/interface/property context)
+        # — signature is only relevant for method context backward compat
+        if entry.signature and not entry.ref_type:
+            d["signature"] = entry.signature
+        # For override/inherited entries, include signature (spec requires it)
+        elif entry.signature and entry.ref_type in ("override", "inherited"):
             d["signature"] = entry.signature
         # Include implementations if present (USES direction)
         if entry.implementations:
@@ -538,7 +543,9 @@ def context_tree_to_dict(result: ContextResult) -> dict:
         if entry.via_interface:
             d["via_interface"] = True
         # Include member reference (what specific member is used)
-        if entry.member_ref:
+        # Skip member_ref for new flat-field entries (class/interface/property context)
+        # — the relevant data is already in flat fields (refType, callee, on, onKind)
+        if entry.member_ref and not entry.ref_type:
             member_ref_dict = {
                 "target_name": entry.member_ref.target_name,
                 "target_fqn": entry.member_ref.target_fqn,

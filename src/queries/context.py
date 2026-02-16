@@ -793,6 +793,22 @@ class ContextQuery(Query[ContextResult]):
                 info.return_type = {}
             info.return_type["static"] = True
 
+        # If property itself isn't readonly, check if the containing class is readonly
+        # (PHP readonly classes make all properties implicitly readonly)
+        if not readonly:
+            parent_id = self.index.get_contains_parent(node_id)
+            if parent_id:
+                parent_node = self.index.nodes.get(parent_id)
+                if parent_node and parent_node.kind == "Class" and parent_node.documentation:
+                    for doc in parent_node.documentation:
+                        if "readonly class" in doc or "readonly " in doc:
+                            readonly = True
+                            break
+            if readonly:
+                if not info.return_type:
+                    info.return_type = {}
+                info.return_type["readonly"] = True
+
         # If no class type from edges, use type from documentation
         if not info.return_type or "name" not in info.return_type:
             if doc_type:
@@ -2963,12 +2979,12 @@ class ContextQuery(Query[ContextResult]):
                 on_line=ol,
             )
 
-            # Build on display string from receiver_names
+            # Build on display string from receiver_names (no tags — onKind is separate)
             on_display = None
             if receiver_names:
                 parts = []
                 for rname, rkind in receiver_names:
-                    parts.append(f"{rname} [{rkind}]")
+                    parts.append(rname)
                 on_display = ", ".join(parts)
 
             entry = ContextEntry(
