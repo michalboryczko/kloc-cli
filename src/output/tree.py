@@ -239,13 +239,29 @@ def print_definition_section(result: ContextResult, console: Console):
             else:
                 console.print(f"    {arg_name}")
 
-    # Show return type for methods/functions
-    if defn.return_type:
+    # Show return type for methods/functions (not properties)
+    if defn.return_type and defn.kind not in ("Property",):
         type_name = defn.return_type.get("name", defn.return_type.get("fqn", "?"))
         console.print(f"  [dim]Return type:[/dim] {type_name}")
 
-    # Show type for properties/arguments (reuses return_type field)
-    if defn.kind in ("Property", "Argument") and defn.return_type:
+    # Show property metadata (type, typeFqn, visibility, promoted, readonly, static)
+    if defn.kind == "Property" and defn.return_type:
+        rt = defn.return_type
+        type_name = rt.get("name", rt.get("fqn", "?"))
+        console.print(f"  [dim]Type:[/dim] {type_name}")
+        type_fqn = rt.get("fqn")
+        if type_fqn and type_fqn != type_name:
+            console.print(f"  [dim]Type FQN:[/dim] {type_fqn}")
+        vis = rt.get("visibility")
+        if vis:
+            console.print(f"  [dim]Visibility:[/dim] {vis}")
+        console.print(f"  [dim]Promoted:[/dim] {'yes' if rt.get('promoted') else 'no'}")
+        console.print(f"  [dim]Readonly:[/dim] {'yes' if rt.get('readonly') else 'no'}")
+        if rt.get("static"):
+            console.print(f"  [dim]Static:[/dim] yes")
+
+    # Show type for arguments (reuses return_type field)
+    if defn.kind == "Argument" and defn.return_type:
         type_name = defn.return_type.get("name", defn.return_type.get("fqn", "?"))
         console.print(f"  [dim]Type:[/dim] {type_name}")
 

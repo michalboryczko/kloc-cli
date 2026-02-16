@@ -2936,7 +2936,13 @@ class ContextQuery(Query[ContextResult]):
             value_expr = value_node.name
         elif value_node.value_kind == "literal":
             value_source = "literal"
-            value_expr = value_node.name
+            # Use expression from argument edge if available (has actual value)
+            arg_expression = None
+            for arg_vid, _pos, expr, _param in self.index.get_arguments(call_id):
+                if arg_vid == value_id and expr:
+                    arg_expression = expr
+                    break
+            value_expr = arg_expression if arg_expression else value_node.name
         elif value_node.value_kind == "result":
             value_source = "result"
             # Try to get the expression from source call
@@ -3078,7 +3084,14 @@ class ContextQuery(Query[ContextResult]):
             if receiver_names:
                 parts = []
                 for rname, rkind in receiver_names:
-                    parts.append(rname)
+                    if rkind == "self":
+                        # Show full property access expression for self-property
+                        prop_name = property_node.name
+                        if not prop_name.startswith("$"):
+                            prop_name = "$" + prop_name
+                        parts.append(f"$this->{prop_name.lstrip('$')} ({property_node.fqn})")
+                    else:
+                        parts.append(rname)
                 on_display = ", ".join(parts)
 
             entry = ContextEntry(
@@ -3094,19 +3107,70 @@ class ContextQuery(Query[ContextResult]):
                 ref_type=reference_type or "property_access",
                 callee=self._member_display_name(property_node),
                 on=on_display,
-                on_kind=receiver_names[0][1] if receiver_names else ok,
+                on_kind="property" if (receiver_names and receiver_names[0][1] == "self") else (receiver_names[0][1] if receiver_names else ok),
                 sites=sites,
             )
 
             # Depth 2: trace result Values of each access
             if depth < max_depth:
+                # Collect result Value IDs produced by property access calls
+                # so we can filter constructor args to only the relevant one
+                property_result_value_ids: set[str] = set()
                 for call_id, call_node in calls:
                     result_id = self.index.get_produces(call_id)
+                    if result_id:
+                        property_result_value_ids.add(result_id)
                     if result_id and result_id not in visited:
                         child_entries = self._build_value_consumer_chain(
                             result_id, depth + 1, max_depth, limit, visited
                         )
                         entry.children.extend(child_entries)
+
+                # ISSUE-O: Filter constructor/method args to only the one
+                # matching the queried property. For each depth-2 child entry,
+                # keep only arguments whose value traces back to our property.
+                prop_name_bare = property_node.name.lstrip("$")
+                for child_entry in entry.children:
+                    if child_entry.arguments:
+                        filtered_args = []
+                        for arg in child_entry.arguments:
+                            # Check if value_expr references the queried property
+                            # e.g. "$savedOrder->id" ends with the property name "id"
+                            if arg.value_expr and arg.value_expr.endswith(
+                                f"->{prop_name_bare}"
+                            ):
+                                filtered_args.append(arg)
+                            elif arg.value_expr and arg.value_expr.endswith(
+                                f"->{property_node.name}"
+                            ):
+                                filtered_args.append(arg)
+                            # Also check source_chain for property FQN reference
+                            elif arg.source_chain:
+                                for step in arg.source_chain:
+                                    if isinstance(step, dict) and step.get("fqn") == property_node.fqn:
+                                        filtered_args.append(arg)
+                                        break
+                        # Only apply filter if we found matches; if none match,
+                        # keep all args (better to show too much than nothing)
+                        if filtered_args:
+                            child_entry.arguments = filtered_args
+
+                # ISSUE-S+J fix: add upstream callers instead of downstream reads
+                # If depth-2 children exist, replace their depth-3 children with callers
+                # If no depth-2 children, add callers directly as depth-2 entries
+                if entry.children and depth + 1 < max_depth:
+                    caller_entries = self._build_caller_chain_for_method(
+                        scope_id, depth + 2, max_depth
+                    )
+                    if caller_entries:
+                        for child in entry.children:
+                            child.children = caller_entries
+                elif not entry.children:
+                    caller_entries = self._build_caller_chain_for_method(
+                        scope_id, depth + 1, max_depth
+                    )
+                    if caller_entries:
+                        entry.children = caller_entries
 
             entries.append(entry)
 
@@ -3416,6 +3480,27 @@ class ContextQuery(Query[ContextResult]):
                         })
 
                 elif ref_type in ("parameter_type", "return_type", "type_hint"):
+                    # For return_type, show method-level FQN instead of class-level
+                    if ref_type == "return_type" and source_node.kind in ("Method", "Function"):
+                        method_fqn = source_node.fqn
+                        if source_node.kind == "Method" and not method_fqn.endswith("()"):
+                            method_fqn += "()"
+                        already_exists = any(e.fqn == method_fqn for e in param_return_entries)
+                        if not already_exists:
+                            entry = ContextEntry(
+                                depth=1,
+                                node_id=source_id,
+                                fqn=method_fqn,
+                                kind=source_node.kind,
+                                file=source_node.file,
+                                line=source_node.start_line,
+                                signature=source_node.signature,
+                                ref_type=ref_type,
+                                children=[],
+                            )
+                            param_return_entries.append(entry)
+                        continue
+
                     # Group by containing class
                     cls_id = source_id
                     node = source_node
@@ -3619,6 +3704,121 @@ class ContextQuery(Query[ContextResult]):
 
         return all_entries[:limit]
 
+    def _build_caller_chain(
+        self, call_site_id: str, depth: int, max_depth: int, visited: set[str] | None = None
+    ) -> list[ContextEntry]:
+        """Build upstream caller chain from a call site node.
+
+        Given a Call node (e.g., a method_call or property_access at depth 2),
+        find the containing method, then find callers of that method using
+        override root resolution to handle interface/concrete method lookups.
+
+        This is the shared helper for depth-3 expansion in:
+        - _build_property_used_by (property USED BY)
+        - _build_injection_point_calls (class USED BY > property_type)
+        - _build_interface_injection_point_calls (interface USED BY > property_type)
+        """
+        if depth > max_depth:
+            return []
+
+        if visited is None:
+            visited = set()
+
+        # Find the containing method of the call site
+        scope_id = get_containing_scope(self.index, call_site_id)
+        if not scope_id or scope_id in visited:
+            return []
+
+        return self._build_caller_chain_for_method(scope_id, depth, max_depth, visited)
+
+    def _build_caller_chain_for_method(
+        self, method_id: str, depth: int, max_depth: int, visited: set[str] | None = None
+    ) -> list[ContextEntry]:
+        """Build upstream caller chain starting from a known method ID.
+
+        Finds callers of the given method using override root resolution:
+        callers may reference the interface method rather than the concrete
+        implementation, so we check both.
+        """
+        if depth > max_depth:
+            return []
+
+        if visited is None:
+            visited = set()
+
+        method_node = self.index.nodes.get(method_id)
+        if not method_node or method_node.kind not in ("Method", "Function"):
+            return []
+
+        if method_id in visited:
+            return []
+        visited.add(method_id)
+
+        # Find callers via override root resolution
+        override_root = self.index.get_override_root(method_id)
+        caller_method_ids: set[str] = set()
+
+        # Collect callers of the method itself
+        self._collect_callers_from_usages(method_id, visited, caller_method_ids)
+
+        # Also collect callers of the override root (interface method)
+        if override_root and override_root != method_id:
+            self._collect_callers_from_usages(override_root, visited, caller_method_ids)
+
+        # Build caller entries
+        entries = []
+        for caller_id in caller_method_ids:
+            caller_node = self.index.nodes.get(caller_id)
+            if not caller_node:
+                continue
+
+            display_fqn = caller_node.fqn
+            if caller_node.kind == "Method" and not display_fqn.endswith("()"):
+                display_fqn += "()"
+
+            entry = ContextEntry(
+                depth=depth,
+                node_id=caller_id,
+                fqn=display_fqn,
+                kind=caller_node.kind,
+                file=caller_node.file,
+                line=caller_node.start_line,
+                ref_type="caller",
+                children=[],
+            )
+
+            # Recursive caller expansion
+            if depth < max_depth:
+                entry.children = self._build_caller_chain_for_method(
+                    caller_id, depth + 1, max_depth, visited.copy()
+                )
+
+            entries.append(entry)
+
+        entries.sort(key=lambda e: (e.file or "", e.line if e.line is not None else 0))
+        return entries
+
+    def _collect_callers_from_usages(
+        self, target_method_id: str, visited: set[str], result: set[str]
+    ) -> None:
+        """Collect containing methods of all chainable usages of a target method."""
+        for source_id, edges in self.index.get_usages_grouped(target_method_id).items():
+            for edge in edges:
+                call_node_id = find_call_for_usage(
+                    self.index, source_id, edge.target,
+                    edge.location.get("file") if edge.location else None,
+                    edge.location.get("line") if edge.location else None,
+                )
+                if call_node_id:
+                    ref_type = get_reference_type_from_call(self.index, call_node_id)
+                else:
+                    target_node = self.index.nodes.get(edge.target)
+                    ref_type = _infer_reference_type(edge, target_node, self.index) if target_node else "uses"
+                if ref_type in CHAINABLE_REFERENCE_TYPES:
+                    containing = self._resolve_containing_method(source_id)
+                    if containing and containing not in visited:
+                        result.add(containing)
+
     def _build_class_used_by_depth_callers(
         self, method_id: str, depth: int, max_depth: int, visited: set[str]
     ) -> list[ContextEntry]:
@@ -3716,47 +3916,45 @@ class ContextQuery(Query[ContextResult]):
     ) -> list[ContextEntry]:
         """Build override method entries for a subclass under [extends] in USED BY.
 
-        Shows which methods the subclass overrides from the parent.
+        Shows which methods the subclass overrides from the parent class/interface.
+        Uses get_overrides_parent() directly to detect overrides, which handles
+        the full hierarchy chain including grandparent methods (ISSUE-E fix).
         """
         if depth > max_depth:
             return []
 
         entries = []
-        parent_methods = {}
-        for child_id in self.index.get_contains_children(parent_class_id):
-            child = self.index.nodes.get(child_id)
-            if child and child.kind == "Method" and child.name != "__construct":
-                parent_methods[child.name] = child_id
 
-        # Find override methods in the subclass
+        # Find override methods in the subclass using direct overrides edge check.
+        # This handles grandparent methods (e.g., findAll from BaseRepositoryInterface)
+        # that the old name-matching approach missed.
         for child_id in self.index.get_contains_children(subclass_id):
             child = self.index.nodes.get(child_id)
             if not child or child.kind != "Method" or child.name == "__construct":
                 continue
 
-            # Check if this method overrides a parent method
-            if child.name in parent_methods:
-                override_parent_id = self.index.get_overrides_parent(child_id)
-                if override_parent_id:
-                    entry = ContextEntry(
-                        depth=depth,
-                        node_id=child_id,
-                        fqn=child.fqn,
-                        kind="Method",
-                        file=child.file,
-                        line=child.start_line,
-                        signature=child.signature,
-                        ref_type="override",
-                        children=[],
+            # Check if this method overrides ANY ancestor method via the overrides edge
+            override_parent_id = self.index.get_overrides_parent(child_id)
+            if override_parent_id:
+                entry = ContextEntry(
+                    depth=depth,
+                    node_id=child_id,
+                    fqn=child.fqn,
+                    kind="Method",
+                    file=child.file,
+                    line=child.start_line,
+                    signature=child.signature,
+                    ref_type="override",
+                    children=[],
+                )
+
+                # At depth 3, show what the override method does internally
+                if depth < max_depth:
+                    entry.children = self._build_override_method_internals(
+                        child_id, depth + 1, max_depth
                     )
 
-                    # At depth 3, show what the override method does internally
-                    if depth < max_depth:
-                        entry.children = self._build_override_method_internals(
-                            child_id, depth + 1, max_depth
-                        )
-
-                    entries.append(entry)
+                entries.append(entry)
 
         entries.sort(key=lambda e: (e.file or "", e.line if e.line is not None else 0))
         return entries
@@ -3785,6 +3983,11 @@ class ContextQuery(Query[ContextResult]):
                 continue
             target_node = self.index.nodes.get(target_id)
             if not target_node:
+                continue
+
+            # Filter out property access noise at depth 3 — these are
+            # implementation details, not class-level dependencies
+            if target_node.kind in ("Property", "StaticProperty"):
                 continue
 
             ref_type = get_reference_type_from_call(self.index, call_id)
@@ -3894,11 +4097,31 @@ class ContextQuery(Query[ContextResult]):
                     children=[],
                 )
 
-                # Depth 3: expand into callee's execution flow
-                if depth < max_depth:
-                    entry.children = self._build_execution_flow(
-                        target_id, depth + 1, max_depth, 100, {target_id}, [0],
+                # Depth 3: show callers of the containing method (ISSUE-S+J fix)
+                # If no callers found, show the containing method itself as terminal
+                if depth < max_depth and method_child_id:
+                    callers = self._build_caller_chain_for_method(
+                        method_child_id, depth + 1, max_depth
                     )
+                    if callers:
+                        entry.children = callers
+                    else:
+                        # Terminal: show the containing method itself as a caller node
+                        method_n = self.index.nodes.get(method_child_id)
+                        if method_n:
+                            display = method_n.fqn
+                            if method_n.kind == "Method" and not display.endswith("()"):
+                                display += "()"
+                            entry.children = [ContextEntry(
+                                depth=depth + 1,
+                                node_id=method_child_id,
+                                fqn=display,
+                                kind=method_n.kind,
+                                file=method_n.file,
+                                line=method_n.start_line,
+                                ref_type="caller",
+                                children=[],
+                            )]
 
                 entries.append(entry)
 
@@ -3947,13 +4170,13 @@ class ContextQuery(Query[ContextResult]):
                 continue
             target_info[target_id] = {
                 "ref_type": "extends",
-                "file": target_node.file,
-                "line": target_node.start_line,
+                "file": start_node.file,
+                "line": start_node.start_line,
                 "property_name": None,
                 "node": target_node,
             }
 
-        # Process implements
+        # Process implements — file ref points to the class declaration
         for edge in implements_edges:
             target_id = edge.target
             if target_id == start_id or target_id in target_info:
@@ -3963,8 +4186,8 @@ class ContextQuery(Query[ContextResult]):
                 continue
             target_info[target_id] = {
                 "ref_type": "implements",
-                "file": target_node.file,
-                "line": target_node.start_line,
+                "file": start_node.file,
+                "line": start_node.start_line,
                 "property_name": None,
                 "node": target_node,
             }
@@ -4317,6 +4540,11 @@ class ContextQuery(Query[ContextResult]):
                     ref_type="inherited",
                     children=[],
                 )
+                # Expand inherited method internals at depth 3 (same as override)
+                if depth < max_depth:
+                    entry.children = self._build_override_method_internals(
+                        method_id, depth + 1, max_depth
+                    )
                 inherited_entries.append(entry)
 
         # Overrides first, then inherited
@@ -4327,34 +4555,25 @@ class ContextQuery(Query[ContextResult]):
     def _build_implements_depth2(
         self, class_id: str, interface_id: str, depth: int, max_depth: int
     ) -> list[ContextEntry]:
-        """Build depth-2 for [implements]: show override methods (contract obligations)."""
+        """Build depth-2 for [implements]: show override methods and extends subclasses.
+
+        Uses get_overrides_parent() directly to detect overrides (ISSUE-E fix).
+        Also adds [extends] entries for concrete subclasses (ISSUE-D fix).
+        """
         if depth > max_depth:
             return []
 
-        entries = []
+        override_entries = []
+        extends_entries = []
 
-        # Get interface methods
-        interface_methods = {}
-        for child_id in self.index.get_contains_children(interface_id):
-            child = self.index.nodes.get(child_id)
-            if child and child.kind == "Method":
-                interface_methods[child.name] = (child_id, child)
-
-        # Also include inherited interface methods (interface extends interface)
-        parent_iface_id = self.index.get_extends_parent(interface_id)
-        if parent_iface_id:
-            for child_id in self.index.get_contains_children(parent_iface_id):
-                child = self.index.nodes.get(child_id)
-                if child and child.kind == "Method" and child.name not in interface_methods:
-                    interface_methods[child.name] = (child_id, child)
-
-        # Find override methods in the implementing class
+        # Find override methods in the implementing class using direct overrides edge check.
         for child_id in self.index.get_contains_children(class_id):
             child = self.index.nodes.get(child_id)
             if not child or child.kind != "Method" or child.name == "__construct":
                 continue
 
-            if child.name in interface_methods:
+            override_parent_id = self.index.get_overrides_parent(child_id)
+            if override_parent_id:
                 entry = ContextEntry(
                     depth=depth,
                     node_id=child_id,
@@ -4371,10 +4590,64 @@ class ContextQuery(Query[ContextResult]):
                     entry.children = self._build_override_method_internals(
                         child_id, depth + 1, max_depth
                     )
-                entries.append(entry)
+                override_entries.append(entry)
 
-        entries.sort(key=lambda e: (e.file or "", e.line if e.line is not None else 0))
+        # ISSUE-D: Add [extends] entries for concrete subclasses
+        # Recursively find all classes that extend the implementing class
+        self._collect_extends_entries(class_id, depth, max_depth, extends_entries, set())
+
+        override_entries.sort(key=lambda e: (e.file or "", e.line if e.line is not None else 0))
+        extends_entries.sort(key=lambda e: (e.file or "", e.line if e.line is not None else 0))
+        return override_entries + extends_entries
+
+    @staticmethod
+    def _offset_entry_depths(entries: list, offset: int) -> list:
+        """Recursively add an offset to depth values in context entries."""
+        for entry in entries:
+            entry.depth += offset
+            if entry.children:
+                ContextQuery._offset_entry_depths(entry.children, offset)
         return entries
+
+    def _collect_extends_entries(
+        self, class_id: str, depth: int, max_depth: int,
+        result: list, visited: set[str]
+    ) -> None:
+        """Recursively collect [extends] entries for subclasses of a class."""
+        if class_id in visited:
+            return
+        visited.add(class_id)
+
+        for child_id in self.index.get_extends_children(class_id):
+            child_node = self.index.nodes.get(child_id)
+            if not child_node or child_id in visited:
+                continue
+
+            entry = ContextEntry(
+                depth=depth,
+                node_id=child_id,
+                fqn=child_node.fqn,
+                kind=child_node.kind,
+                file=child_node.file,
+                line=child_node.start_line,
+                ref_type="extends",
+                children=[],
+            )
+
+            # At depth 3: show USED BY of this subclass (instantiation sites, etc.)
+            if depth < max_depth:
+                raw_children = self._build_class_used_by(
+                    child_id, max_depth - depth, limit=10, include_impl=False
+                )
+                # _build_class_used_by starts depth from 1 internally;
+                # offset to match our actual depth context
+                depth_offset = depth  # e.g., depth=2 -> children should be depth 3
+                entry.children = self._offset_entry_depths(raw_children, depth_offset)
+
+            result.append(entry)
+
+            # Recursively find further subclasses
+            self._collect_extends_entries(child_id, depth, max_depth, result, visited)
 
     def _build_behavioral_depth2(
         self, class_id: str, dep_class_id: str, property_name: str | None,
@@ -4488,7 +4761,10 @@ class ContextQuery(Query[ContextResult]):
             return []
 
         entries = []
-        edges = self.index.get_deps(target_id, include_members=True)
+        # Collect uses edges + extends edges (get_deps only returns uses)
+        edges = list(self.index.get_deps(target_id, include_members=True))
+        for ext_edge in self.index.outgoing[target_id].get("extends", []):
+            edges.append(ext_edge)
         local_visited: set[str] = set()
 
         for edge in edges:
@@ -4538,6 +4814,13 @@ class ContextQuery(Query[ContextResult]):
                 property_name=property_name,
                 children=[],
             )
+
+            # Recursive expansion for class-level deps at depth 2+
+            if depth < max_depth and resolved_node.kind in ("Class", "Interface", "Trait", "Enum"):
+                entry.children = self._build_class_uses_recursive(
+                    resolved_id, depth + 1, max_depth, limit, visited | local_visited
+                )
+
             entries.append(entry)
 
         # Sort by priority
@@ -4586,33 +4869,34 @@ class ContextQuery(Query[ContextResult]):
                     all_interface_ids.append(child_id)
                     queue.append(child_id)
 
-        # --- Collect implementors (direct + transitive through child interfaces) ---
-        for iface_id in all_interface_ids:
-            implementor_ids = self.index.get_implementors(iface_id)
-            for impl_id in implementor_ids:
-                impl_node = self.index.nodes.get(impl_id)
-                if not impl_node or impl_id in visited_sources:
-                    continue
-                visited_sources.add(impl_id)
+        # --- Collect implementors (DIRECT only — ISSUE-C fix) ---
+        # Only show classes that implement this interface directly,
+        # not classes that implement a child interface transitively.
+        direct_implementor_ids = self.index.get_implementors(start_id)
+        for impl_id in direct_implementor_ids:
+            impl_node = self.index.nodes.get(impl_id)
+            if not impl_node or impl_id in visited_sources:
+                continue
+            visited_sources.add(impl_id)
 
-                entry = ContextEntry(
-                    depth=1,
-                    node_id=impl_id,
-                    fqn=impl_node.fqn,
-                    kind=impl_node.kind,
-                    file=impl_node.file,
-                    line=impl_node.start_line,
-                    ref_type="implements",
-                    children=[],
+            entry = ContextEntry(
+                depth=1,
+                node_id=impl_id,
+                fqn=impl_node.fqn,
+                kind=impl_node.kind,
+                file=impl_node.file,
+                line=impl_node.start_line,
+                ref_type="implements",
+                children=[],
+            )
+
+            # Depth 2: override methods + extends entries (ISSUE-D)
+            if max_depth >= 2:
+                entry.children = self._build_implements_depth2(
+                    impl_id, start_id, 2, max_depth
                 )
 
-                # Depth 2: override methods
-                if max_depth >= 2:
-                    entry.children = self._build_implements_depth2(
-                        impl_id, start_id, 2, max_depth
-                    )
-
-                implements_entries.append(entry)
+            implements_entries.append(entry)
 
         # --- Collect child interfaces (incoming extends edges — direct only) ---
         extends_child_ids = self.index.get_extends_children(start_id)
@@ -4632,6 +4916,13 @@ class ContextQuery(Query[ContextResult]):
                 ref_type="extends",
                 children=[],
             )
+
+            # ISSUE-I: Depth 2 — own methods + deeper extends for child interfaces
+            if max_depth >= 2:
+                entry.children = self._build_interface_extends_depth2(
+                    child_id, 2, max_depth
+                )
+
             extends_entries.append(entry)
 
         # --- Pass 1: Identify classes with property_type injection (for suppression) ---
@@ -4660,6 +4951,34 @@ class ContextQuery(Query[ContextResult]):
                         if node and node.kind in ("Class", "Interface", "Trait", "Enum"):
                             classes_with_injection.add(cls_id)
 
+        # Also check usages of implementors for property_type injection (ISSUE-D)
+        for impl_id in direct_implementor_ids:
+            for source_id, edges in self.index.get_usages_grouped(impl_id).items():
+                source_node = self.index.nodes.get(source_id)
+                if not source_node:
+                    continue
+                for edge in edges:
+                    target_node = self.index.nodes.get(edge.target)
+                    if not target_node:
+                        continue
+                    ref_type = _infer_reference_type(edge, target_node, self.index)
+                    if ref_type == "property_type":
+                        cls_id = source_id
+                        node = source_node
+                        while node and node.kind not in ("Class", "Interface", "Trait", "Enum", "File"):
+                            cls_id = self.index.get_contains_parent(cls_id)
+                            node = self.index.nodes.get(cls_id) if cls_id else None
+                        if node and node.kind in ("Class", "Interface", "Trait", "Enum"):
+                            classes_with_injection.add(cls_id)
+
+        # --- ISSUE-B: Collect the target interface's own contract method names ---
+        # Only methods declared directly on the queried interface count as "contract"
+        contract_method_names: set[str] = set()
+        for child_id in self.index.get_contains_children(start_id):
+            child = self.index.nodes.get(child_id)
+            if child and child.kind == "Method":
+                contract_method_names.add(child.name)
+
         # --- Pass 2: Process uses edges for injection points (from all interfaces) ---
         for iface_id, source_groups in all_source_groups:
             iface_node = self.index.nodes.get(iface_id)
@@ -4686,6 +5005,10 @@ class ContextQuery(Query[ContextResult]):
                         ref_type = _infer_reference_type(edge, target_node, self.index)
 
                     if ref_type == "property_type":
+                        # ISSUE-C: Skip indirect property_type entries (from child interfaces)
+                        if iface_id != start_id:
+                            continue
+
                         # Resolve property node
                         prop_fqn = None
                         prop_node = None
@@ -4707,6 +5030,16 @@ class ContextQuery(Query[ContextResult]):
                                             break
 
                         if prop_fqn and prop_node and prop_fqn not in seen_property_type_props:
+                            # ISSUE-B: Check contract relevance before including consumer.
+                            # Verify that the consumer calls at least one method from the
+                            # target interface's own contract through this property.
+                            if contract_method_names:
+                                calls_contract = self._consumer_calls_contract_methods(
+                                    prop_node.id, contract_method_names
+                                )
+                                if not calls_contract:
+                                    continue  # Skip irrelevant consumer
+
                             seen_property_type_props.add(prop_fqn)
                             visited_sources.add(source_id)
 
@@ -4731,6 +5064,13 @@ class ContextQuery(Query[ContextResult]):
                                     prop_node.id, iface_id, 2, max_depth
                                 )
 
+                                # ISSUE-B: Filter depth-2 children to only contract methods
+                                if contract_method_names:
+                                    entry.children = [
+                                        c for c in entry.children
+                                        if self._entry_targets_contract_method(c, contract_method_names)
+                                    ]
+
                             property_type_entries.append(entry)
 
                     elif ref_type == "method_call":
@@ -4749,6 +5089,97 @@ class ContextQuery(Query[ContextResult]):
                         # Skip type_hint/parameter_type/return_type — these are subsumed
                         # by property_type entries or are constructor signature refs
                         continue
+
+        # --- Pass 3: Discover property_type consumers typed to implementing classes (ISSUE-D) ---
+        # Properties typed as an abstract/concrete implementor (not the interface itself)
+        # should also appear as [property_type] consumers of the interface.
+        # Example: OrderService::$orderProcessor typed as AbstractOrderProcessor
+        #          should appear under OrderProcessorInterface USED BY.
+        for impl_id in direct_implementor_ids:
+            impl_usages = self.index.get_usages_grouped(impl_id)
+            for source_id, edges in impl_usages.items():
+                if source_id in visited_sources:
+                    continue
+                source_node = self.index.nodes.get(source_id)
+                if not source_node:
+                    continue
+                for edge in edges:
+                    target_node = self.index.nodes.get(edge.target)
+                    if not target_node:
+                        continue
+                    ref_type = _infer_reference_type(edge, target_node, self.index)
+                    if ref_type != "property_type":
+                        continue
+
+                    # Resolve the actual property node
+                    prop_fqn = None
+                    prop_node = None
+                    if source_node.kind == "Property":
+                        prop_fqn = source_node.fqn
+                        prop_node = source_node
+                    elif source_node.kind in ("Method", "Function"):
+                        # Constructor promotion: check class properties for type_hint to implementor
+                        containing_class_id = self.index.get_contains_parent(source_id)
+                        if containing_class_id:
+                            for child_id in self.index.get_contains_children(containing_class_id):
+                                child = self.index.nodes.get(child_id)
+                                if child and child.kind == "Property":
+                                    for th_edge in self.index.outgoing[child_id].get("type_hint", []):
+                                        if th_edge.target == impl_id:
+                                            prop_fqn = child.fqn
+                                            prop_node = child
+                                            break
+                                    if prop_fqn:
+                                        break
+
+                    if not prop_fqn or not prop_node or prop_fqn in seen_property_type_props:
+                        continue
+
+                    # Ensure property is not in the implementor class itself
+                    prop_class_id = self.index.get_contains_parent(prop_node.id)
+                    if prop_class_id == impl_id:
+                        continue
+
+                    # ISSUE-B: Check contract relevance
+                    if contract_method_names:
+                        calls_contract = self._consumer_calls_contract_methods(
+                            prop_node.id, contract_method_names
+                        )
+                        if not calls_contract:
+                            continue
+
+                    seen_property_type_props.add(prop_fqn)
+                    visited_sources.add(source_id)
+
+                    impl_node = self.index.nodes.get(impl_id)
+                    via_fqn = impl_node.fqn if impl_node else None
+
+                    entry = ContextEntry(
+                        depth=1,
+                        node_id=prop_node.id,
+                        fqn=prop_fqn,
+                        kind="Property",
+                        file=prop_node.file,
+                        line=prop_node.start_line,
+                        ref_type="property_type",
+                        via=via_fqn,
+                        children=[],
+                    )
+
+                    # Depth 2: method calls through this property
+                    if max_depth >= 2:
+                        entry.children = self._build_interface_injection_point_calls(
+                            prop_node.id, start_id, 2, max_depth
+                        )
+
+                        # ISSUE-B: Filter depth-2 children to only contract methods
+                        if contract_method_names:
+                            entry.children = [
+                                c for c in entry.children
+                                if self._entry_targets_contract_method(c, contract_method_names)
+                            ]
+
+                    property_type_entries.append(entry)
 
         # Sort within groups
         implements_entries.sort(key=lambda e: (e.file or "", e.line if e.line is not None else 0))
@@ -4840,13 +5271,153 @@ class ContextQuery(Query[ContextResult]):
                     children=[],
                 )
 
-                # Depth 3: show callers of the containing method
+                # Depth 3: show callers of the containing method (ISSUE-S+J fix)
+                # If no callers found, show the containing method itself as terminal
                 if depth < max_depth and method_child_id:
-                    entry.children = self._build_class_used_by_depth_callers(
-                        method_child_id, depth + 1, max_depth, set()
+                    callers = self._build_caller_chain_for_method(
+                        method_child_id, depth + 1, max_depth
                     )
+                    if callers:
+                        entry.children = callers
+                    else:
+                        # Terminal: show the containing method itself as a caller node
+                        method_n = self.index.nodes.get(method_child_id)
+                        if method_n:
+                            display = method_n.fqn
+                            if method_n.kind == "Method" and not display.endswith("()"):
+                                display += "()"
+                            entry.children = [ContextEntry(
+                                depth=depth + 1,
+                                node_id=method_child_id,
+                                fqn=display,
+                                kind=method_n.kind,
+                                file=method_n.file,
+                                line=method_n.start_line,
+                                ref_type="caller",
+                                children=[],
+                            )]
 
                 entries.append(entry)
+
+        entries.sort(key=lambda e: (e.file or "", e.line if e.line is not None else 0))
+        return entries
+
+    def _consumer_calls_contract_methods(
+        self, property_id: str, contract_method_names: set[str]
+    ) -> bool:
+        """Check if a property's containing class calls any contract method through it.
+
+        Traverses the containing class's methods to find Call nodes whose
+        receiver chain resolves to this property, and checks if the called
+        method name matches any contract method name.
+        """
+        prop_node = self.index.nodes.get(property_id)
+        if not prop_node or prop_node.kind != "Property":
+            return False
+
+        containing_class_id = self.index.get_contains_parent(property_id)
+        if not containing_class_id:
+            return False
+
+        for method_child_id in self.index.get_contains_children(containing_class_id):
+            method_node = self.index.nodes.get(method_child_id)
+            if not method_node or method_node.kind != "Method":
+                continue
+
+            for call_child_id in self.index.get_contains_children(method_child_id):
+                call_child = self.index.nodes.get(call_child_id)
+                if not call_child or call_child.kind != "Call":
+                    continue
+
+                # Check if this call's receiver is our property
+                chain_symbol = resolve_access_chain_symbol(self.index, call_child_id)
+                if chain_symbol != prop_node.fqn:
+                    continue
+
+                # Check if the called method name matches a contract method
+                target_id = self.index.get_call_target(call_child_id)
+                if not target_id:
+                    continue
+                target_node = self.index.nodes.get(target_id)
+                if target_node and target_node.name in contract_method_names:
+                    return True
+
+        return False
+
+    @staticmethod
+    def _entry_targets_contract_method(
+        entry: "ContextEntry", contract_method_names: set[str]
+    ) -> bool:
+        """Check if a depth-2 method_call entry targets a contract method."""
+        if entry.ref_type != "method_call":
+            return True  # Non-method_call entries pass through
+        # Extract method name from FQN
+        fqn = entry.fqn
+        if "::" in fqn:
+            method_name = fqn.rsplit("::", 1)[-1]
+        else:
+            method_name = fqn
+        method_name = method_name.rstrip("()")
+        return method_name in contract_method_names
+
+    def _build_interface_extends_depth2(
+        self, interface_id: str, depth: int, max_depth: int
+    ) -> list[ContextEntry]:
+        """Build depth-2 children for an [extends] interface entry.
+
+        Shows:
+        1. Own methods declared by this interface (not inherited) as [own_method]
+        2. Deeper extends relationships (interfaces extending this one)
+        """
+        if depth > max_depth:
+            return []
+
+        entries: list[ContextEntry] = []
+
+        # 1. Own methods (methods declared directly on this interface)
+        for child_id in self.index.get_contains_children(interface_id):
+            child = self.index.nodes.get(child_id)
+            if not child or child.kind != "Method":
+                continue
+
+            entry = ContextEntry(
+                depth=depth,
+                node_id=child_id,
+                fqn=child.fqn,
+                kind="Method",
+                file=child.file,
+                line=child.start_line,
+                signature=child.signature,
+                ref_type="own_method",
+                children=[],
+            )
+            entries.append(entry)
+
+        # 2. Deeper extends (interfaces that extend this one)
+        extends_child_ids = self.index.get_extends_children(interface_id)
+        for child_id in extends_child_ids:
+            child_node = self.index.nodes.get(child_id)
+            if not child_node:
+                continue
+
+            entry = ContextEntry(
+                depth=depth,
+                node_id=child_id,
+                fqn=child_node.fqn,
+                kind=child_node.kind,
+                file=child_node.file,
+                line=child_node.start_line,
+                ref_type="extends",
+                children=[],
+            )
+
+            # Recursive expansion for deeper chains
+            if depth < max_depth:
+                entry.children = self._build_interface_extends_depth2(
+                    child_id, depth + 1, max_depth
+                )
+
+            entries.append(entry)
 
         entries.sort(key=lambda e: (e.file or "", e.line if e.line is not None else 0))
         return entries
@@ -4934,6 +5505,63 @@ class ContextQuery(Query[ContextResult]):
                         "line": child.start_line,
                         "node": t_node,
                     }
+
+        # --- ISSUE-G: Collect inherited method signature types ---
+        # Walk up the extends chain to find types in inherited method signatures
+        parent_queue = list(extends_edges)
+        visited_parents: set[str] = {start_id}
+        for edge in parent_queue:
+            parent_id = edge.target
+            if parent_id in visited_parents:
+                continue
+            visited_parents.add(parent_id)
+
+            for child_id in self.index.get_contains_children(parent_id):
+                child = self.index.nodes.get(child_id)
+                if not child or child.kind != "Method":
+                    continue
+
+                # Return type from inherited method
+                for th_edge in self.index.outgoing.get(child_id, {}).get("type_hint", []):
+                    tid = th_edge.target
+                    if tid == start_id or tid in target_info:
+                        continue
+                    t_node = self.index.nodes.get(tid)
+                    if not t_node:
+                        continue
+                    target_info[tid] = {
+                        "ref_type": "return_type",
+                        "file": start_node.file,
+                        "line": start_node.start_line,
+                        "node": t_node,
+                    }
+
+                # Parameter types from inherited method arguments
+                for sub_id in self.index.get_contains_children(child_id):
+                    sub = self.index.nodes.get(sub_id)
+                    if not sub or sub.kind != "Argument":
+                        continue
+                    for th_edge in self.index.outgoing.get(sub_id, {}).get("type_hint", []):
+                        tid = th_edge.target
+                        if tid == start_id:
+                            continue
+                        t_node = self.index.nodes.get(tid)
+                        if not t_node:
+                            continue
+                        existing = target_info.get(tid)
+                        if existing and existing["ref_type"] not in ("return_type",):
+                            continue
+                        target_info[tid] = {
+                            "ref_type": "parameter_type",
+                            "file": start_node.file,
+                            "line": start_node.start_line,
+                            "node": t_node,
+                        }
+
+            # Continue up the chain: add grandparent extends edges
+            for gp_edge in self.index.outgoing[parent_id].get("extends", []):
+                if gp_edge.target not in visited_parents:
+                    parent_queue.append(gp_edge)
 
         # --- Collect implementing classes (if --impl) ---
         if include_impl:
