@@ -81,48 +81,48 @@ class TestReferenceTypeInference:
     def test_tc1_type_hint_detection(self, index):
         """TC1: Type hint detection for OrderService -> OrderRepositoryInterface.
 
-        Type hints appear as references from:
-        - Constructor parameters (constructor property promotion)
-        - Method parameters/return types
-        - Property declarations
-
-        After Phase 1, type_hint is split into parameter_type, return_type,
-        property_type. Accept any of these type-related reference types.
+        After ISSUE-D (Interface context redesign), interface USED BY returns
+        entries with ref_type directly on ContextEntry. Constructor property
+        injections appear as [property_type] entries.
         """
         # Query OrderRepositoryInterface
         node = index.resolve_symbol("App\\Repository\\OrderRepositoryInterface")[0]
         query = ContextQuery(index)
         result = query.execute(node.id, depth=1)
 
-        # Find a type-related reference (any of the type_hint subtypes)
+        # Interface USED BY uses ref_type directly on entries
         TYPE_RELATED = {"type_hint", "parameter_type", "return_type", "property_type"}
         type_entries = [
             e for e in result.used_by
-            if e.member_ref and e.member_ref.reference_type in TYPE_RELATED
+            if e.ref_type in TYPE_RELATED
             and "OrderService" in e.fqn
         ]
         assert len(type_entries) > 0, (
             "Should find type-related references to OrderRepositoryInterface from OrderService. "
-            f"Found: {[e.member_ref.reference_type for e in result.used_by if e.member_ref and 'OrderService' in e.fqn]}"
+            f"Found ref_types: {[(e.fqn, e.ref_type) for e in result.used_by]}"
         )
 
     def test_tc3_interface_type_hint(self, index):
-        """TC3: Interface type hint detection."""
+        """TC3: Interface type hint detection.
+
+        After ISSUE-D, interface USED BY returns property_type entries for
+        constructor-injected properties.
+        """
         # Query EmailSenderInterface
         node = index.resolve_symbol("App\\Component\\EmailSenderInterface")[0]
         query = ContextQuery(index)
         result = query.execute(node.id, depth=1)
 
-        # Find a type-related reference (any of the type_hint subtypes)
+        # Interface USED BY uses ref_type directly on entries
         TYPE_RELATED = {"type_hint", "parameter_type", "return_type", "property_type"}
         type_entries = [
             e for e in result.used_by
-            if e.member_ref and e.member_ref.reference_type in TYPE_RELATED
+            if e.ref_type in TYPE_RELATED
             and "OrderService" in e.fqn
         ]
         assert len(type_entries) > 0, (
             "Should find type-related references to EmailSenderInterface from OrderService. "
-            f"Found: {[e.member_ref.reference_type for e in result.used_by if e.member_ref and 'OrderService' in e.fqn]}"
+            f"Found ref_types: {[(e.fqn, e.ref_type) for e in result.used_by]}"
         )
 
 
@@ -134,32 +134,62 @@ class TestAccessChains:
     """
 
     def test_tc2_method_call_with_chain(self, index):
-        """TC2: Method call via property shows access chain."""
-        # Query OrderRepositoryInterface
+        """TC2: Method call via property shows access chain.
+
+        After ISSUE-D, method calls on interface are at depth 2 under
+        [property_type] entries. Check depth-2 children for save().
+        """
+        # Query OrderRepositoryInterface at depth 2
         node = index.resolve_symbol("App\\Repository\\OrderRepositoryInterface")[0]
         query = ContextQuery(index)
-        result = query.execute(node.id, depth=1)
+        result = query.execute(node.id, depth=2)
 
-        # Find the save() method call entry
-        entry = find_entry_by_member(result.used_by, "save()")
-        assert entry is not None, "save() method call should be in used_by"
-        assert entry.member_ref is not None
-        assert entry.member_ref.reference_type == "method_call"
-        assert entry.member_ref.access_chain == "$this->orderRepository"
+        # Find property_type entry for OrderService
+        prop_entry = None
+        for e in result.used_by:
+            if e.ref_type == "property_type" and "OrderService" in e.fqn:
+                prop_entry = e
+                break
+        assert prop_entry is not None, "OrderService property_type entry should exist"
+
+        # Find save() in depth-2 children
+        save_entry = None
+        for child in prop_entry.children:
+            if child.callee and "save" in child.callee:
+                save_entry = child
+                break
+        assert save_entry is not None, "save() method call should be depth-2 child of property_type"
+        assert save_entry.ref_type == "method_call"
+        assert save_entry.on is not None and "orderRepository" in save_entry.on
 
     def test_tc4_interface_method_call(self, index):
-        """TC4: Interface method call shows access chain."""
-        # Query EmailSenderInterface
+        """TC4: Interface method call shows access chain.
+
+        After ISSUE-D, method calls on interface are at depth 2 under
+        [property_type] entries.
+        """
+        # Query EmailSenderInterface at depth 2
         node = index.resolve_symbol("App\\Component\\EmailSenderInterface")[0]
         query = ContextQuery(index)
-        result = query.execute(node.id, depth=1)
+        result = query.execute(node.id, depth=2)
 
-        # Find the send() method call entry
-        entry = find_entry_by_member(result.used_by, "send()")
-        assert entry is not None, "send() method call should be in used_by"
-        assert entry.member_ref is not None
-        assert entry.member_ref.reference_type == "method_call"
-        assert entry.member_ref.access_chain == "$this->emailSender"
+        # Find property_type entry for OrderService
+        prop_entry = None
+        for e in result.used_by:
+            if e.ref_type == "property_type" and "OrderService" in e.fqn:
+                prop_entry = e
+                break
+        assert prop_entry is not None, "OrderService property_type entry should exist"
+
+        # Find send() in depth-2 children
+        send_entry = None
+        for child in prop_entry.children:
+            if child.callee and "send" in child.callee:
+                send_entry = child
+                break
+        assert send_entry is not None, "send() method call should be depth-2 child of property_type"
+        assert send_entry.ref_type == "method_call"
+        assert send_entry.on is not None and "emailSender" in send_entry.on
 
     def test_tc5_constructor_call(self, index):
         """TC5: Constructor call shows instantiation type."""
@@ -179,36 +209,26 @@ class TestAccessChains:
         # (depends on edge representation)
 
     def test_tc8_direct_class_instantiation(self, index):
-        """TC8: Direct class reference in USED BY shows type-related references.
+        """TC8: Class USED BY shows grouped, classified entries.
 
-        In the unified graph format, constructor calls are represented as:
-        - Call node with call_kind=constructor
-        - calls edge to Class::__construct() method
-
-        The `uses` edges to a Class node come from type hints and property types,
-        not from constructor call sites. Constructor calls target __construct(),
-        which is a separate Method node. So querying the Class used_by shows
-        type-related references (parameter_type, return_type, property_type,
-        or type_hint), not instantiation.
-
-        After Phase 1, type_hint is split into parameter_type, return_type,
-        property_type. We accept any of these type-related reference types.
+        After ISSUE-B (Class USED BY Redesign), class-level queries return
+        entries with ref_type set directly on ContextEntry (not via member_ref).
+        The entries are classified as instantiation, extends, property_type,
+        method_call, property_access, parameter_type, or return_type.
         """
         # Query Order entity
         node = index.resolve_symbol("App\\Entity\\Order")[0]
         query = ContextQuery(index)
         result = query.execute(node.id, depth=1)
 
-        # Class-level uses edges come from type hints and property declarations.
-        # Accept any of the type-related reference types.
-        TYPE_RELATED = {"type_hint", "parameter_type", "return_type", "property_type"}
-        type_entries = [
-            e for e in result.used_by
-            if e.member_ref and e.member_ref.reference_type in TYPE_RELATED
-        ]
-        assert len(type_entries) > 0, (
-            f"Expected type-related references to Order class. "
-            f"Found: {[e.member_ref.reference_type for e in result.used_by if e.member_ref][:10]}"
+        # Class-level USED BY entries use ref_type directly on the entry
+        ref_types = {e.ref_type for e in result.used_by if e.ref_type}
+        EXPECTED_TYPES = {"instantiation", "extends", "implements", "property_type",
+                         "method_call", "property_access", "parameter_type",
+                         "return_type", "type_hint"}
+        assert ref_types & EXPECTED_TYPES, (
+            f"Expected classified reference types on Order USED BY. "
+            f"Found ref_types: {ref_types}"
         )
 
 
@@ -216,90 +236,117 @@ class TestMultipleReferences:
     """Tests for multiple reference handling (TC6)."""
 
     def test_tc6_multiple_method_calls(self, index):
-        """TC6: Multiple method calls from same scope appear separately."""
-        # Query OrderRepositoryInterface
+        """TC6: Multiple method calls from different scopes appear under property_type.
+
+        After ISSUE-D, interface method calls are grouped under [property_type]
+        injection point entries at depth 2. Multiple consumers each show their
+        own method calls.
+        """
+        # Query OrderRepositoryInterface at depth 2
         node = index.resolve_symbol("App\\Repository\\OrderRepositoryInterface")[0]
         query = ContextQuery(index)
-        result = query.execute(node.id, depth=1)
+        result = query.execute(node.id, depth=2)
 
-        # Count findById() calls - should be multiple
-        findById_entries = [
-            e for e in result.used_by
-            if e.member_ref and e.member_ref.target_name == "findById()"
-        ]
-        assert len(findById_entries) >= 2, "Multiple findById() calls should appear separately"
+        # Count total findById() calls across all property_type entries
+        findById_count = 0
+        for e in result.used_by:
+            if e.ref_type == "property_type":
+                for child in e.children:
+                    if child.callee and "findById" in child.callee:
+                        findById_count += 1
+        assert findById_count >= 2, (
+            f"Multiple findById() calls should appear across property_type entries, found {findById_count}"
+        )
 
 
 class TestV1FormatBackwardCompatibility:
     """Tests for backward compatibility with v1.0 sot.json (without Value/Call nodes)."""
 
     def test_ec1_v1_format_degrades_gracefully(self, index):
-        """When using v1.0 format sot.json, reference types are inferred, no chains.
+        """Interface USED BY returns structured entries with ref_type.
 
-        Note: This test uses v2.0 format but validates that the inference fallback
-        works correctly when Call nodes are not found for a given usage.
+        After ISSUE-D, interface queries return grouped entries with ref_type
+        directly on ContextEntry. Method calls are at depth 2 under property_type.
         """
-        # Query OrderRepositoryInterface (used_by side)
+        # Query OrderRepositoryInterface at depth 2
         node = index.resolve_symbol("App\\Repository\\OrderRepositoryInterface")[0]
         query = ContextQuery(index)
-        result = query.execute(node.id, depth=1)
+        result = query.execute(node.id, depth=2)
 
-        # Find the save() method call in used_by
-        entry = find_entry_by_member(result.used_by, "save()")
-        assert entry is not None
-
-        # Should have reference type (either from Call node or inferred)
-        assert entry.member_ref is not None
-        assert entry.member_ref.reference_type == "method_call"
-
-        # With v2.0 format, we should have access chain from Call nodes
-        # (This test validates that the graph-based chain building works)
-        assert entry.member_ref.access_chain == "$this->orderRepository"
+        # Find save() in depth-2 children of a property_type entry
+        save_entry = None
+        for e in result.used_by:
+            if e.ref_type == "property_type":
+                for child in e.children:
+                    if child.callee and "save" in child.callee:
+                        save_entry = child
+                        break
+                if save_entry:
+                    break
+        assert save_entry is not None, "save() should appear under property_type entry"
+        assert save_entry.ref_type == "method_call"
+        assert save_entry.on is not None and "orderRepository" in save_entry.on
 
 
 class TestJsonOutput:
     """Tests for JSON output format (OF3)."""
 
     def test_json_includes_reference_type(self, index):
-        """JSON output includes reference_type field."""
+        """JSON output includes refType field for interface queries.
+
+        After ISSUE-D, interface entries have ref_type directly (not member_ref).
+        """
         from src.output.tree import context_tree_to_dict
 
-        # Use OrderRepositoryInterface (OrderRepository class is not in the index)
+        # Use OrderRepositoryInterface
         node = index.resolve_symbol("App\\Repository\\OrderRepositoryInterface")[0]
         query = ContextQuery(index)
         result = query.execute(node.id, depth=1)
 
         json_dict = context_tree_to_dict(result)
 
-        # Check that used_by entries have member_ref with reference_type
+        # Check that usedBy entries have refType
         found_ref_type = False
-        for entry in json_dict["used_by"]:
-            if "member_ref" in entry and entry["member_ref"].get("reference_type"):
+        for entry in json_dict["usedBy"]:
+            if entry.get("refType"):
                 found_ref_type = True
                 break
 
-        assert found_ref_type, "JSON output should include reference_type in member_ref"
+        assert found_ref_type, (
+            "JSON output should include refType on interface USED BY entries. "
+            f"Found: {json_dict['usedBy']}"
+        )
 
     def test_json_includes_access_chain(self, index):
-        """JSON output includes access_chain field when available."""
+        """JSON output includes 'on' field for method calls under property_type.
+
+        After ISSUE-D, method calls are at depth 2 under property_type entries.
+        The 'on' field contains the access chain expression.
+        """
         from src.output.tree import context_tree_to_dict
 
-        # Use OrderRepositoryInterface (OrderRepository class is not in the index)
+        # Use OrderRepositoryInterface at depth 2
         node = index.resolve_symbol("App\\Repository\\OrderRepositoryInterface")[0]
         query = ContextQuery(index)
-        result = query.execute(node.id, depth=1)
+        result = query.execute(node.id, depth=2)
 
         json_dict = context_tree_to_dict(result)
 
-        # Check that method call entries have access_chain
+        # Check that property_type entries have method_call children with 'on'
         found_chain = False
-        for entry in json_dict["used_by"]:
-            if "member_ref" in entry:
-                if entry["member_ref"].get("access_chain"):
-                    found_chain = True
-                    break
+        for entry in json_dict["usedBy"]:
+            if entry.get("refType") == "property_type":
+                for child in entry.get("children", []):
+                    if child.get("on"):
+                        found_chain = True
+                        break
+            if found_chain:
+                break
 
-        assert found_chain, "JSON output should include access_chain for method calls"
+        assert found_chain, (
+            "JSON output should include 'on' (access chain) for method calls. "
+            f"Found entries: {json_dict['usedBy']}"
+        )
 
 
 class TestCalleeVerificationIntegration:
@@ -655,36 +702,21 @@ class TestPhase1ReferenceTypeDistinction:
         )
 
     def test_t1_5_property_type_shows_property_type(self, index):
-        """T1.5 / AC4: Property type hint shows [property_type].
+        """T1.5 / AC4: Class USES shows property_type for injected dependencies.
 
-        When the uses edge source is a Property node, the reference should
-        show as [property_type]. With PHP 8+ constructor property promotion,
-        properties declared via constructor params have their uses edges
-        sourced from the Method (constructor), not the Property directly.
-
-        This test validates property_type when the source IS a Property node.
-        For the reference project, class-level type references from constructor
-        promotion show as type_hint (no Argument or Method type_hint edge
-        matches), which is acceptable fallback behavior.
+        After ISSUE-C (Class USES Redesign), class-level queries return entries
+        with ref_type set directly on ContextEntry. Property dependencies with
+        type_hint edges from Property nodes should show as [property_type].
         """
-        # At class level, constructor-promoted properties show as type_hint
-        # because the uses edge source is __construct() (Method), not Property.
-        # Verify that type_hint entries exist for these (not property_type).
         node = index.resolve_symbol("App\\Service\\OrderService")[0]
         query = ContextQuery(index)
         result = query.execute(node.id, depth=1)
 
-        # Find type-related references in USES (type_hint or property_type only;
-        # parameter_type and return_type are now filtered from USES)
-        TYPE_RELATED = {"type_hint", "property_type"}
-        type_entries = [
-            e for e in result.uses
-            if e.member_ref and e.member_ref.reference_type in TYPE_RELATED
-        ]
-        assert len(type_entries) > 0, (
-            f"OrderService should have type-related references in USES. "
-            f"Found reference types: "
-            f"{[e.member_ref.reference_type for e in result.uses if e.member_ref]}"
+        # Class-level USES entries use ref_type directly on the entry
+        ref_types = {e.ref_type for e in result.uses if e.ref_type}
+        assert "property_type" in ref_types, (
+            f"OrderService USES should have property_type entries. "
+            f"Found ref_types: {ref_types}"
         )
 
     def test_t1_10_json_output_includes_new_reference_types(self, index):
@@ -1246,27 +1278,23 @@ class TestPhase3ExecutionFlow:
                 )
 
     def test_t3_4_class_level_query_uses_structural_approach(self, index):
-        """T3.4 / AC16: Class-level context query still uses structural approach.
+        """T3.4 / AC16: Class-level context query uses class-specific grouping.
 
-        When querying a Class (not a Method), the USES direction should
-        show structural dependencies (extends, implements, type_hint,
-        property_access) rather than execution flow.
+        After ISSUE-C (Class USES Redesign), class-level queries return
+        grouped, deduplicated entries with ref_type set directly on ContextEntry.
+        Should show structural types like extends, implements, property_type,
+        parameter_type, return_type, instantiation — NOT execution flow.
         """
         # Use InMemoryOrderRepository (concrete class in the index)
         node = index.resolve_symbol("App\\Repository\\InMemoryOrderRepository")[0]
         query = ContextQuery(index)
         result = query.execute(node.id, depth=1)
 
-        # Class-level query should have structural entries
-        ref_types = {
-            e.member_ref.reference_type
-            for e in result.uses
-            if e.member_ref
-        }
-        # Should include structural types. Note: parameter_type and return_type
-        # are only filtered from Method/Function USES, not Class-level USES.
+        # Class-level USES entries use ref_type directly on ContextEntry
+        ref_types = {e.ref_type for e in result.uses if e.ref_type}
         structural_types = {"property_access", "parameter_type", "type_hint",
-                           "return_type", "property_type"}
+                           "return_type", "property_type", "extends", "implements",
+                           "instantiation"}
         assert ref_types & structural_types, (
             f"Class-level USES should include structural reference types. Found: {ref_types}"
         )
@@ -1646,8 +1674,8 @@ class TestDefinitionJsonOutput:
 
         json_dict = context_tree_to_dict(result)
         defn = json_dict["definition"]
-        assert "declared_in" in defn
-        assert "OrderService" in defn["declared_in"]["fqn"]
+        assert "declaredIn" in defn
+        assert "OrderService" in defn["declaredIn"]["fqn"]
 
     def test_mcp_response_includes_definition(self, index):
         """AC23: MCP response includes definition object."""
@@ -1925,23 +1953,22 @@ class TestIssueB_FilterSignatureTypes:
                 )
 
     def test_ac13_property_type_kept_in_class_uses(self, index):
-        """AC13: Class query retains [property_type] entries in USES."""
+        """AC13: Class query retains [property_type] entries in USES.
+
+        After ISSUE-C (Class USES Redesign), class-level queries return
+        entries with ref_type set directly on ContextEntry.
+        """
         node = index.resolve_symbol("App\\Service\\OrderService")[0]
         query = ContextQuery(index)
         result = query.execute(node.id, depth=1)
 
-        # Class-level USES should still include type references
-        # (property_type, type_hint, parameter_type, return_type are all kept
-        # at class level since _get_type_references is only for Method/Function)
-        TYPE_RELATED = {"type_hint", "property_type", "parameter_type", "return_type"}
-        type_entries = [
-            e for e in result.uses
-            if e.member_ref and e.member_ref.reference_type in TYPE_RELATED
-        ]
-        assert len(type_entries) > 0, (
+        # Class-level USES entries use ref_type directly on ContextEntry
+        ref_types = {e.ref_type for e in result.uses if e.ref_type}
+        TYPE_RELATED = {"type_hint", "property_type", "parameter_type", "return_type",
+                       "instantiation", "extends", "implements"}
+        assert ref_types & TYPE_RELATED, (
             f"Class-level USES should retain type reference entries. "
-            f"Found reference types: "
-            f"{[e.member_ref.reference_type for e in result.uses if e.member_ref]}"
+            f"Found ref_types: {ref_types}"
         )
 
     def test_ac14_type_hint_kept_in_method_uses(self, index):
@@ -1994,24 +2021,21 @@ class TestIssueB_FilterSignatureTypes:
                 )
 
     def test_ac16_non_method_query_unchanged(self, index):
-        """AC16: Non-Method/Function queries are unchanged (no regression).
+        """AC16: Class-level queries use class-specific grouping (ISSUE-B/C).
 
-        Class-level queries use the structural approach and include all
-        reference types including parameter_type and return_type.
+        After ISSUE-C (Class USES Redesign), class-level queries return
+        grouped, deduplicated entries with ref_type set directly on ContextEntry.
         """
         # Query a Class node
         node = index.resolve_symbol("App\\Repository\\InMemoryOrderRepository")[0]
         query = ContextQuery(index)
         result = query.execute(node.id, depth=1)
 
-        # Class-level should still have structural types
-        ref_types = {
-            e.member_ref.reference_type
-            for e in result.uses
-            if e.member_ref
-        }
+        # Class-level USES entries use ref_type directly on ContextEntry
+        ref_types = {e.ref_type for e in result.uses if e.ref_type}
         structural_types = {"property_access", "parameter_type", "type_hint",
-                           "return_type", "property_type"}
+                           "return_type", "property_type", "extends", "implements",
+                           "instantiation"}
         assert ref_types & structural_types, (
             f"Class-level USES should include structural reference types. "
             f"Found: {ref_types}"

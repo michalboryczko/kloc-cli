@@ -616,8 +616,8 @@ def context_tree_to_dict(result: ContextResult) -> dict:
 
     d = {
         "target": target_dict,
-        "max_depth": result.max_depth,
-        "used_by": [context_entry_to_dict(e) for e in result.used_by],
+        "maxDepth": result.max_depth,
+        "usedBy": [context_entry_to_dict(e) for e in result.used_by],
         "uses": [context_entry_to_dict(e) for e in result.uses],
     }
 
@@ -633,10 +633,32 @@ def context_tree_to_dict(result: ContextResult) -> dict:
             defn_dict["signature"] = defn.signature
         if defn.arguments:
             defn_dict["arguments"] = defn.arguments
-        if defn.return_type:
-            defn_dict["return_type"] = defn.return_type
-        if defn.declared_in:
-            defn_dict["declared_in"] = defn.declared_in
+        # For Property definitions, extract metadata from return_type into
+        # top-level fields (type, visibility, promoted, readonly, static)
+        if defn.kind == "Property" and defn.return_type:
+            rt = defn.return_type
+            type_name = rt.get("name", rt.get("fqn"))
+            if type_name:
+                defn_dict["type"] = type_name
+            if rt.get("visibility"):
+                defn_dict["visibility"] = rt["visibility"]
+            if rt.get("promoted"):
+                defn_dict["promoted"] = True
+            if rt.get("readonly"):
+                defn_dict["readonly"] = True
+            if rt.get("static"):
+                defn_dict["static"] = True
+        elif defn.return_type:
+            defn_dict["returnType"] = defn.return_type
+        # declaredIn only for non-class/interface kinds (properties, methods, etc.)
+        if defn.declared_in and defn.kind not in ("Class", "Interface", "Trait", "Enum"):
+            declared_in = defn.declared_in
+            raw_line = declared_in.get("line")
+            defn_dict["declaredIn"] = {
+                "fqn": declared_in.get("fqn"),
+                "file": declared_in.get("file"),
+                "line": raw_line + 1 if raw_line is not None else None,
+            }
         if defn.properties:
             defn_dict["properties"] = defn.properties
         if defn.methods:
@@ -656,7 +678,7 @@ def context_tree_to_dict(result: ContextResult) -> dict:
             defn_dict["source"] = defn.source
         # context-final ISSUE-G: Constructor dependencies
         if defn.constructor_deps:
-            defn_dict["constructor_deps"] = defn.constructor_deps
+            defn_dict["constructorDeps"] = defn.constructor_deps
         d["definition"] = defn_dict
 
     return d

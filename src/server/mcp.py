@@ -337,7 +337,7 @@ class MCPServer:
                 d["source_call"] = entry_to_dict(e.source_call)
             return d
 
-        response = {"target": {"fqn": result.target.fqn, "file": result.target.file}, "used_by": [entry_to_dict(e) for e in result.used_by], "uses": [entry_to_dict(e) for e in result.uses]}
+        response = {"target": {"fqn": result.target.fqn, "file": result.target.file}, "usedBy": [entry_to_dict(e) for e in result.used_by], "uses": [entry_to_dict(e) for e in result.uses]}
 
         if result.definition:
             defn = result.definition
@@ -351,10 +351,23 @@ class MCPServer:
                 defn_dict["signature"] = defn.signature
             if defn.arguments:
                 defn_dict["arguments"] = defn.arguments
-            if defn.return_type:
-                defn_dict["return_type"] = defn.return_type
-            if defn.declared_in:
-                defn_dict["declared_in"] = defn.declared_in
+            if defn.kind == "Property" and defn.return_type:
+                rt = defn.return_type
+                type_name = rt.get("name", rt.get("fqn"))
+                if type_name:
+                    defn_dict["type"] = type_name
+                if rt.get("visibility"):
+                    defn_dict["visibility"] = rt["visibility"]
+                if rt.get("promoted"):
+                    defn_dict["promoted"] = True
+                if rt.get("readonly"):
+                    defn_dict["readonly"] = True
+                if rt.get("static"):
+                    defn_dict["static"] = True
+            elif defn.return_type:
+                defn_dict["returnType"] = defn.return_type
+            if defn.declared_in and defn.kind not in ("Class", "Interface", "Trait", "Enum"):
+                defn_dict["declaredIn"] = defn.declared_in
             if defn.properties:
                 defn_dict["properties"] = defn.properties
             if defn.methods:
