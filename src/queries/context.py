@@ -1512,30 +1512,6 @@ class ContextQuery(Query[ContextResult]):
             # Depth expansion: trace forward into callee body
             if depth < max_depth and consumer_target_id and consumer_target:
                 if consumer_target.kind in ("Method", "Function"):
-                    children_ids = self.index.get_contains_children(consumer_target_id)
-                    promoted = self._get_promoted_params(children_ids)
-                    if promoted:
-                        # Constructor with promoted params — trace property usages
-                        for access_info in access_infos:
-                            pos = access_info["position"]
-                            if pos < len(promoted):
-                                param_node = promoted[pos]
-                                for af_edge in self.index.incoming[param_node.id].get(
-                                    "assigned_from", []
-                                ):
-                                    prop_node = self.index.nodes.get(af_edge.source)
-                                    if prop_node and prop_node.kind == "Property":
-                                        prop_entry = ContextEntry(
-                                            depth=depth + 1,
-                                            node_id=prop_node.id,
-                                            fqn=prop_node.fqn,
-                                            kind=prop_node.kind,
-                                            file=prop_node.file,
-                                            line=prop_node.start_line,
-                                            children=[],
-                                        )
-                                        entry.children.append(prop_entry)
-
                     # ISSUE-E: Cross-method USED BY — cross into callee via parameter FQN
                     self._cross_into_callee(
                         consumer_call_id, consumer_target_id, consumer_target,
