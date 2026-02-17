@@ -1089,6 +1089,16 @@ class ContextQuery(Query[ContextResult]):
         if start_node and start_node.kind == "Interface":
             return self._build_interface_used_by(start_id, max_depth, limit, include_impl)
 
+        # ISSUE-A: Constructor special case — redirect usedBy to containing Class node.
+        # `new ClassName(...)` creates a uses edge targeting the Class, not __construct().
+        # So querying __construct() directly finds no usages. Redirect to Class-level lookup.
+        if start_node and start_node.kind == "Method" and start_node.name == "__construct":
+            containing_class_id = self.index.get_contains_parent(start_id)
+            if containing_class_id:
+                class_node = self.index.nodes.get(containing_class_id)
+                if class_node and class_node.kind in ("Class", "Enum"):
+                    return self._build_class_used_by(containing_class_id, max_depth, limit, include_impl)
+
         is_class_query = start_node and start_node.kind in ("Class", "Interface", "Trait", "Enum")
 
         # Global visited set prevents the same source from appearing at multiple depths
@@ -1162,6 +1172,7 @@ class ContextQuery(Query[ContextResult]):
                     access_chain = None
                     reference_type = None
                     access_chain_symbol = None
+                    call_node_id = None
 
                     if is_member:
                         target_node = self.index.nodes.get(edge.target)
@@ -1216,7 +1227,7 @@ class ContextQuery(Query[ContextResult]):
                         # For direct edges, create a member_ref to hold the reference_type
                         # and access_chain
                         member_ref = MemberRef(
-                            target_name="",  # No specific member
+                            target_name=self._member_display_name(target_node) if target_node else "",
                             target_fqn=target_node.fqn if target_node else edge.target,
                             target_kind=target_node.kind if target_node else None,
                             file=file,
@@ -1237,6 +1248,11 @@ class ContextQuery(Query[ContextResult]):
                                 entry_fqn = resolved_node.fqn
                                 entry_kind = resolved_node.kind
 
+                    # ISSUE-I: Add argument info for method_call entries
+                    arguments = []
+                    if call_node_id:
+                        arguments = self._get_argument_info(call_node_id)
+
                     entry = ContextEntry(
                         depth=current_depth,
                         node_id=source_id,
@@ -1247,6 +1263,7 @@ class ContextQuery(Query[ContextResult]):
                         signature=source_node.signature if source_node else None,
                         children=[],
                         member_ref=member_ref,
+                        arguments=arguments,
                     )
                     entries.append(entry)
 
@@ -1290,9 +1307,11 @@ class ContextQuery(Query[ContextResult]):
         # Build direct usages first
         direct_entries = build_tree(start_id, 1)
 
-        # If include_impl, also build interface usages grouped under the interface method
+        # If include_impl, also build interface/implementation usages
         interface_entries = []
         if include_impl:
+            # Existing: concrete -> interface direction
+            # When querying a concrete method, also show callers of the interface method
             interface_method_ids = self._get_interface_method_ids(start_id)
             for iface_id in interface_method_ids:
                 if iface_id in visited:
@@ -1327,7 +1346,7 @@ class ContextQuery(Query[ContextResult]):
     def _build_value_consumer_chain(
         self, value_id: str, depth: int, max_depth: int, limit: int,
         visited: set | None = None,
-        crossing_count: int = 0, max_crossings: int = 3
+        crossing_count: int = 0, max_crossings: int | None = None
     ) -> list[ContextEntry]:
         """Build consumer chain for a Value node (USED BY section).
 
@@ -1356,6 +1375,9 @@ class ContextQuery(Query[ContextResult]):
         Returns:
             List of ContextEntry representing consuming Calls, sorted by line number.
         """
+        if max_crossings is None:
+            max_crossings = min(max_depth, 10)
+
         if depth > max_depth:
             return []
 
@@ -1459,7 +1481,7 @@ class ContextQuery(Query[ContextResult]):
                 reference_type = get_reference_type_from_call(self.index, consumer_call_id)
                 ac, acs, ok, of, ol = self._resolve_receiver_identity(consumer_call_id)
                 member_ref = MemberRef(
-                    target_name="",
+                    target_name=self._member_display_name(consumer_target),
                     target_fqn=consumer_target.fqn,
                     target_kind=consumer_target.kind,
                     file=consumer_call_node.file,
@@ -1621,7 +1643,7 @@ class ContextQuery(Query[ContextResult]):
                 reference_type = get_reference_type_from_call(self.index, consumer_call_id)
                 ac, acs, ok, of, ol = self._resolve_receiver_identity(consumer_call_id)
                 member_ref = MemberRef(
-                    target_name="",
+                    target_name=self._member_display_name(consumer_target),
                     target_fqn=consumer_target.fqn,
                     target_kind=consumer_target.kind,
                     file=consumer_call_node.file,
@@ -1691,7 +1713,7 @@ class ContextQuery(Query[ContextResult]):
     def _cross_into_callee(
         self, call_node_id: str, callee_id: str, callee_node,
         entry: "ContextEntry", depth: int, max_depth: int, limit: int,
-        visited: set, crossing_count: int = 0, max_crossings: int = 3
+        visited: set, crossing_count: int = 0, max_crossings: int | None = None
     ) -> None:
         """Cross method boundary from caller into callee for USED BY tracing.
 
@@ -1713,6 +1735,8 @@ class ContextQuery(Query[ContextResult]):
             crossing_count: Number of return crossings so far in this chain.
             max_crossings: Maximum return crossings allowed per chain.
         """
+        if max_crossings is None:
+            max_crossings = min(max_depth, 10)
         # Cross into callee via argument parameter FQNs
         arg_edges = self.index.get_arguments(call_node_id)
         for _, _, _, parameter_fqn in arg_edges:
@@ -1757,7 +1781,7 @@ class ContextQuery(Query[ContextResult]):
     def _cross_into_callers_via_return(
         self, call_node_id: str, entry: "ContextEntry",
         depth: int, max_depth: int, limit: int, visited: set,
-        crossing_count: int = 0, max_crossings: int = 3
+        crossing_count: int = 0, max_crossings: int | None = None
     ) -> None:
         """Cross from callee return back into caller scope via return value.
 
@@ -1785,6 +1809,9 @@ class ContextQuery(Query[ContextResult]):
             crossing_count: Number of return crossings so far in this chain.
             max_crossings: Maximum number of return crossings allowed per chain.
         """
+        if max_crossings is None:
+            max_crossings = min(max_depth, 10)
+
         if depth >= max_depth:
             return
 
@@ -1881,10 +1908,15 @@ class ContextQuery(Query[ContextResult]):
                     on_file = recv_node.file
                 if recv_node.range and recv_node.range.get("start_line") is not None:
                     on_line = recv_node.range["start_line"]
+            elif recv_node and recv_node.kind == "Value" and recv_node.value_kind == "result":
+                # ISSUE-C: Chain access — receiver is result of a property/method access.
+                # e.g., $customer->address->street: the receiver of ->street is the
+                # result Value of ->address. Mark as "property" chain access.
+                on_kind = "property"
         else:
             # No explicit receiver: check if this is a $this-> access (implicit self)
             call_node = self.index.nodes.get(call_node_id)
-            if call_node and call_node.kind == "Call" and call_node.call_kind == "access":
+            if call_node and call_node.kind == "Call" and call_node.call_kind in ("access", "method", "method_static"):
                 on_kind = "self"
                 if not access_chain:
                     access_chain = "$this"
@@ -2321,7 +2353,7 @@ class ContextQuery(Query[ContextResult]):
             count[0] += 1
 
             member_ref = MemberRef(
-                target_name="",
+                target_name=self._member_display_name(target_node),
                 target_fqn=target_node.fqn,
                 target_kind=target_node.kind,
                 file=file,
@@ -2438,8 +2470,19 @@ class ContextQuery(Query[ContextResult]):
                 ext_fqn = self._build_external_call_fqn(child_id, child)
                 reference_type = get_reference_type_from_call(self.index, child_id)
 
+                # ISSUE-G: Build display name from call node for external calls
+                ext_display_name = ""
+                if child.name:
+                    ck = child.call_kind or ""
+                    if ck in ("method", "method_static", "function", ""):
+                        ext_display_name = child.name if child.name.endswith("()") else f"{child.name}()"
+                    elif ck == "access":
+                        ext_display_name = f"${child.name}" if not child.name.startswith("$") else child.name
+                    else:
+                        ext_display_name = child.name
+
                 member_ref = MemberRef(
-                    target_name="",
+                    target_name=ext_display_name,
                     target_fqn=ext_fqn,
                     target_kind=child.call_kind or "method",
                     file=child.file,
@@ -2537,7 +2580,7 @@ class ContextQuery(Query[ContextResult]):
             call_line = child.range.get("start_line") if child.range else None
 
             member_ref = MemberRef(
-                target_name="",
+                target_name=self._member_display_name(target_node),
                 target_fqn=target_node.fqn,
                 target_kind=target_node.kind,
                 file=child.file,
@@ -2781,7 +2824,7 @@ class ContextQuery(Query[ContextResult]):
         call_line = call_node.range.get("start_line") if call_node.range else None
 
         member_ref = MemberRef(
-            target_name="",
+            target_name=self._member_display_name(target_node),
             target_fqn=target_node.fqn,
             target_kind=target_node.kind,
             file=call_node.file,
@@ -3142,16 +3185,21 @@ class ContextQuery(Query[ContextResult]):
             # Collect unique receivers across all accesses in this method
             receiver_names = []
             for call_id, call_node in calls:
-                _, _, c_ok, _, _ = self._resolve_receiver_identity(call_id)
+                c_ac, _, c_ok, _, _ = self._resolve_receiver_identity(call_id)
                 chain = build_access_chain(self.index, call_id)
                 recv_id = self.index.get_receiver(call_id)
                 if recv_id:
                     recv_node = self.index.nodes.get(recv_id)
                     if recv_node and recv_node.kind == "Value":
-                        rname = recv_node.name
-                        rkind = "local" if recv_node.value_kind == "local" else ("param" if recv_node.value_kind == "parameter" else None)
-                        if rname and rkind and rname not in [r[0] for r in receiver_names]:
-                            receiver_names.append((rname, rkind))
+                        if recv_node.value_kind in ("local", "parameter"):
+                            rname = recv_node.name
+                            rkind = "local" if recv_node.value_kind == "local" else "param"
+                            if rname and rname not in [r[0] for r in receiver_names]:
+                                receiver_names.append((rname, rkind))
+                        elif recv_node.value_kind == "result" and c_ac:
+                            # ISSUE-C: Chain access — use access chain as display name
+                            if c_ac not in [r[0] for r in receiver_names]:
+                                receiver_names.append((c_ac, "property"))
                 elif c_ok == "self":
                     if ("$this", "self") not in receiver_names:
                         receiver_names.append(("$this", "self"))
@@ -3225,6 +3273,20 @@ class ContextQuery(Query[ContextResult]):
                             result_id, depth + 1, max_depth, limit, visited
                         )
                         entry.children.extend(child_entries)
+
+                # ISSUE-D: Deduplicate children from multiple access sites.
+                # When a method accesses the same property multiple times (e.g.,
+                # $contact->email and $contact->phone), each produces a result
+                # Value that may feed into the same downstream consumer (e.g.,
+                # CustomerOutput::__construct()). Deduplicate by (fqn, file, line).
+                seen_children: set[tuple] = set()
+                deduped_children: list[ContextEntry] = []
+                for child in entry.children:
+                    key = (child.fqn, child.file, child.line)
+                    if key not in seen_children:
+                        seen_children.add(key)
+                        deduped_children.append(child)
+                entry.children = deduped_children
 
                 # ISSUE-O: Filter constructor/method args to only the one
                 # matching the queried property. For each depth-2 child entry,
@@ -3531,6 +3593,11 @@ class ContextQuery(Query[ContextResult]):
                     if containing_method and containing_method.kind == "Method" and not method_fqn.endswith("()"):
                         method_fqn += "()"
 
+                    # ISSUE-I: Add argument info for method_call entries
+                    arguments = []
+                    if call_node_id:
+                        arguments = self._get_argument_info(call_node_id)
+
                     entry = ContextEntry(
                         depth=1,
                         node_id=containing_method_id or source_id,
@@ -3543,6 +3610,7 @@ class ContextQuery(Query[ContextResult]):
                         on=on_expr,
                         on_kind=on_kind,
                         children=[],
+                        arguments=arguments,
                     )
                     method_call_entries.append(entry)
 
@@ -3564,7 +3632,9 @@ class ContextQuery(Query[ContextResult]):
 
                     found = False
                     for group_entry in property_access_groups[prop_fqn]:
-                        if group_entry["method_fqn"] == method_fqn:
+                        if (group_entry["method_fqn"] == method_fqn
+                                and group_entry["on_expr"] == on_expr
+                                and group_entry["on_kind"] == on_kind):
                             group_entry["lines"].append(line)
                             found = True
                             break
@@ -3885,6 +3955,7 @@ class ContextQuery(Query[ContextResult]):
                 line=caller_node.start_line,
                 ref_type="caller",
                 children=[],
+                crossed_from=method_node.fqn,  # ISSUE-H: crossed from the method being expanded
             )
 
             # Recursive caller expansion
@@ -3985,6 +4056,11 @@ class ContextQuery(Query[ContextResult]):
                 # Use "caller" refType for depth 3+ entries (upstream callers)
                 entry_ref_type = "caller" if depth >= 3 else "method_call"
 
+                # ISSUE-I: Add argument info for method_call entries
+                arguments = []
+                if call_node_id:
+                    arguments = self._get_argument_info(call_node_id)
+
                 entry = ContextEntry(
                     depth=depth,
                     node_id=containing_method_id or source_id,
@@ -3997,6 +4073,8 @@ class ContextQuery(Query[ContextResult]):
                     on=on_expr,
                     on_kind=on_kind,
                     children=[],
+                    arguments=arguments,
+                    crossed_from=method_node.fqn,  # ISSUE-H: crossed from the method being expanded
                 )
 
                 # Further depth expansion
@@ -4182,6 +4260,10 @@ class ContextQuery(Query[ContextResult]):
                     continue
                 seen_callees.add(callee_key)
 
+                # ISSUE-H: crossed_from the containing class (depth-1 property_type entry)
+                containing_cls_node = self.index.nodes.get(containing_class_id)
+                crossed_from_fqn = containing_cls_node.fqn if containing_cls_node else None
+
                 entry = ContextEntry(
                     depth=depth,
                     node_id=target_id,
@@ -4195,6 +4277,7 @@ class ContextQuery(Query[ContextResult]):
                     on_kind="property",
                     arguments=arguments,
                     children=[],
+                    crossed_from=crossed_from_fqn,
                 )
 
                 # Depth 3: show callers of the containing method (ISSUE-S+J fix)
@@ -5503,6 +5586,10 @@ class ContextQuery(Query[ContextResult]):
                     continue
                 seen_callees.add(callee_key)
 
+                # ISSUE-H: crossed_from the containing class (depth-1 property_type entry)
+                containing_cls_node_iface = self.index.nodes.get(containing_class_id)
+                crossed_from_fqn_iface = containing_cls_node_iface.fqn if containing_cls_node_iface else None
+
                 entry = ContextEntry(
                     depth=depth,
                     node_id=target_id,
@@ -5516,6 +5603,7 @@ class ContextQuery(Query[ContextResult]):
                     on_kind="property",
                     arguments=arguments,
                     children=[],
+                    crossed_from=crossed_from_fqn_iface,
                 )
 
                 # Depth 3: show callers of the containing method (ISSUE-S+J fix)
@@ -5925,8 +6013,48 @@ class ContextQuery(Query[ContextResult]):
                 start_id, 1, max_depth, limit, cycle_guard, count,
                 include_impl=include_impl, shown_impl_for=shown_impl_for,
             )
-            # Combine: type references first, then call entries in execution order
-            return type_entries + call_entries
+
+            # ISSUE-B: interface -> concrete direction for USES section.
+            # When querying an interface method with --impl, the interface method
+            # itself is abstract (no execution flow). Show the execution flows
+            # of each concrete implementation grouped by implementor.
+            impl_entries: list[ContextEntry] = []
+            if include_impl and not call_entries:
+                concrete_method_ids = self._get_concrete_implementors(start_id)
+                for concrete_id in concrete_method_ids:
+                    concrete_node = self.index.nodes.get(concrete_id)
+                    if not concrete_node:
+                        continue
+                    # Build execution flow for this concrete method
+                    impl_cycle_guard = {concrete_id}
+                    impl_count = [0]
+                    impl_shown = set()
+                    impl_type_entries = self._get_type_references(
+                        concrete_id, 1, impl_cycle_guard, impl_count, limit
+                    )
+                    impl_call_entries = self._build_execution_flow(
+                        concrete_id, 1, max_depth, limit, impl_cycle_guard, impl_count,
+                        include_impl=False, shown_impl_for=impl_shown,
+                    )
+                    impl_children = impl_type_entries + impl_call_entries
+                    concrete_fqn = concrete_node.fqn
+                    if concrete_node.kind == "Method" and not concrete_fqn.endswith("()"):
+                        concrete_fqn += "()"
+                    impl_entry = ContextEntry(
+                        depth=0,
+                        node_id=concrete_id,
+                        fqn=concrete_fqn,
+                        kind=concrete_node.kind,
+                        file=concrete_node.file,
+                        line=concrete_node.start_line,
+                        signature=concrete_node.signature,
+                        children=impl_children,
+                        via_interface=True,
+                    )
+                    impl_entries.append(impl_entry)
+
+            # Combine: type references first, then call entries, then impl entries
+            return type_entries + call_entries + impl_entries
 
         # For Value nodes, use source chain traversal
         if start_node and start_node.kind == "Value":
@@ -6005,10 +6133,9 @@ class ContextQuery(Query[ContextResult]):
                         # Fall back to inference from edge/node types
                         reference_type = _infer_reference_type(edge, target_node, self.index)
 
-                    # For USES, target_name is empty since fqn already shows the target
-                    # We only need reference_type and access_chain
+                    # For USES, populate target_name for consistency (ISSUE-G)
                     member_ref = MemberRef(
-                        target_name="",  # Empty - fqn already shows the target
+                        target_name=self._member_display_name(target_node),
                         target_fqn=target_node.fqn,
                         target_kind=target_node.kind,
                         file=file,
@@ -6215,9 +6342,9 @@ class ContextQuery(Query[ContextResult]):
                     # Fall back to inference from edge/node types
                     reference_type = _infer_reference_type(edge, target_node, self.index)
 
-                # For USES, target_name is empty since fqn already shows the target
+                # For USES, populate target_name for consistency (ISSUE-G)
                 member_ref = MemberRef(
-                    target_name="",  # Empty - fqn already shows the target
+                    target_name=self._member_display_name(target_node),
                     target_fqn=target_node.fqn,
                     target_kind=target_node.kind,
                     file=file,
@@ -6314,6 +6441,47 @@ class ContextQuery(Query[ContextResult]):
                             interface_methods.append(child_id)
 
         return interface_methods
+
+    def _get_concrete_implementors(self, interface_method_id: str) -> list[str]:
+        """Get IDs of concrete methods that implement this interface method.
+
+        Reverse lookup of _get_interface_method_ids(): given an interface method
+        like OrderRepositoryInterface::save(), returns concrete methods like
+        [InMemoryOrderRepository::save(), AuditableOrderRepository::save(), ...].
+        """
+        method_node = self.index.nodes.get(interface_method_id)
+        if not method_node or method_node.kind != "Method":
+            return []
+
+        # Find containing interface
+        containing_id = self.index.get_contains_parent(interface_method_id)
+        if not containing_id:
+            return []
+        containing_node = self.index.nodes.get(containing_id)
+        if not containing_node or containing_node.kind != "Interface":
+            return []
+
+        method_name = method_node.name
+        concrete_methods = []
+
+        # Find all classes that implement this interface
+        implementor_ids = self.index.get_implementors(containing_id)
+        # Also check classes that extend interfaces that extend this one
+        extends_children = self.index.get_extends_children(containing_id)
+        for ext_child_id in extends_children:
+            ext_child = self.index.nodes.get(ext_child_id)
+            if ext_child and ext_child.kind == "Interface":
+                implementor_ids.extend(self.index.get_implementors(ext_child_id))
+
+        for impl_id in implementor_ids:
+            # Find method with same name in implementor
+            for child_id in self.index.get_contains_children(impl_id):
+                child_node = self.index.nodes.get(child_id)
+                if (child_node and child_node.kind == "Method"
+                        and child_node.name == method_name):
+                    concrete_methods.append(child_id)
+
+        return concrete_methods
 
     def _build_implementations_tree(
         self, start_id: str, max_depth: int, limit: int

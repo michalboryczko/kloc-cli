@@ -2746,11 +2746,12 @@ class TestV4IssueB_LocalVariableIdentity:
                 break
         assert found_param, "Should find $input with [param] tag in source chain"
 
-    def test_this_property_no_kind_tag(self, index):
-        """v4-B-CLI-05: $this->property receivers have NO kind tag.
+    def test_this_property_has_property_kind_tag(self, index):
+        """v4-B-CLI-05: $this->property receivers have on_kind="property".
 
-        Property chains use access_chain from MemberRef, which should NOT
-        have on_kind set for property receivers.
+        Property chain accesses (e.g., $this->emailSender->send()) have
+        a "result" Value receiver from the property access, which should
+        get on_kind="property" (ISSUE-C fix).
         """
         node = index.resolve_symbol("App\\Service\\OrderService::createOrder")[0]
         query = ContextQuery(index)
@@ -2763,9 +2764,9 @@ class TestV4IssueB_LocalVariableIdentity:
         assert send_call.member_ref.access_chain is not None
         assert "$this->" in send_call.member_ref.access_chain
 
-        # Property chain should NOT have on_kind
-        assert send_call.member_ref.on_kind is None, (
-            f"$this->property should NOT have on_kind, got {send_call.member_ref.on_kind}"
+        # Property chain should have on_kind="property" (receiver is result of property access)
+        assert send_call.member_ref.on_kind == "property", (
+            f"$this->property chain should have on_kind='property', got {send_call.member_ref.on_kind}"
         )
 
     def test_json_includes_on_kind_in_source_chain(self, index):
@@ -2838,6 +2839,9 @@ class TestV4IssueB_LocalVariableIdentity:
 
         mr = find_member_ref_with_on_kind(json_dict["uses"])
         assert mr is not None, "Should find member_ref with on_kind in JSON"
-        assert mr["on_kind"] in ("local", "param")
-        assert "on_file" in mr
-        assert "on_line" in mr
+        assert mr["on_kind"] in ("local", "param", "self", "property")
+        # "self" and "property" entries (implicit $this or chain access) don't have on_file/on_line;
+        # "local" and "param" entries do
+        if mr["on_kind"] in ("local", "param"):
+            assert "on_file" in mr
+            assert "on_line" in mr

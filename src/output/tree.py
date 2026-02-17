@@ -630,9 +630,10 @@ def context_tree_to_dict(result: ContextResult) -> dict:
         if entry.source_call:
             d["source_call"] = context_entry_to_dict(entry.source_call)
         # ISSUE-E: Cross-method boundary crossing indicator
-        # In class-level context mode, suppress crossed_from at ALL depths
-        if entry.crossed_from and not class_level_context:
-            d["crossed_from"] = entry.crossed_from
+        # ISSUE-H: Allow crossed_from for depth-2+ entries in class-level context
+        if entry.crossed_from:
+            if not class_level_context or entry.depth >= 2:
+                d["crossed_from"] = entry.crossed_from
         # context-final ISSUE-G: New flat entry fields for class/interface/property context
         if entry.ref_type:
             d["refType"] = entry.ref_type
