@@ -349,7 +349,7 @@ class TestExpressionPreference:
 
     def test_expression_preferred_over_node_name(self):
         """Expression from edge is used when available, even if node has a name."""
-        from src.queries.context import ContextQuery
+        from src.queries.graph_utils import get_argument_info
 
         # Create a Value node with name "(result)" — the old fallback
         value_node = make_node("Value", "(result)", "result#1")
@@ -363,10 +363,7 @@ class TestExpressionPreference:
             call_targets={},
         )
 
-        query = ContextQuery.__new__(ContextQuery)
-        query.index = index
-
-        args = query._get_argument_info("call:1")
+        args = get_argument_info(index, "call:1")
         assert len(args) == 1
         assert args[0].value_expr == "$input->productId", (
             f"Should use expression '$input->productId', got '{args[0].value_expr}'"
@@ -375,7 +372,7 @@ class TestExpressionPreference:
 
     def test_fallback_to_node_name_when_no_expression(self):
         """Falls back to Value node name when expression is None."""
-        from src.queries.context import ContextQuery
+        from src.queries.graph_utils import get_argument_info
 
         value_node = make_node("Value", "$order", "local#32$order")
         value_node.id = "value:2"
@@ -388,10 +385,7 @@ class TestExpressionPreference:
             call_targets={},
         )
 
-        query = ContextQuery.__new__(ContextQuery)
-        query.index = index
-
-        args = query._get_argument_info("call:2")
+        args = get_argument_info(index, "call:2")
         assert len(args) == 1
         assert args[0].value_expr == "$order", (
             f"Should fall back to node name '$order', got '{args[0].value_expr}'"
@@ -400,7 +394,7 @@ class TestExpressionPreference:
 
     def test_empty_string_expression_falls_back_to_node_name(self):
         """Empty string expression is falsy, so falls back to node name."""
-        from src.queries.context import ContextQuery
+        from src.queries.graph_utils import get_argument_info
 
         value_node = make_node("Value", "(literal)", "literal#5")
         value_node.id = "value:3"
@@ -413,10 +407,7 @@ class TestExpressionPreference:
             call_targets={},
         )
 
-        query = ContextQuery.__new__(ContextQuery)
-        query.index = index
-
-        args = query._get_argument_info("call:3")
+        args = get_argument_info(index, "call:3")
         assert len(args) == 1
         assert args[0].value_expr == "(literal)", (
             f"Empty expression should fall back to '(literal)', got '{args[0].value_expr}'"

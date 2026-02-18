@@ -2355,9 +2355,9 @@ class TestIssueA_ConstructorPromotionResolution:
         """AC7: OrderCreatedMessage::__construct() with single promoted param.
 
         The message call is consumed by dispatch(), so we test param resolution
-        directly via ContextQuery._resolve_param_fqn and _resolve_param_name.
+        directly via resolve_param_fqn and resolve_param_name.
         """
-        query = ContextQuery(index)
+        from src.queries.graph_utils import resolve_param_name, resolve_param_fqn
 
         # Find the Call node for OrderCreatedMessage::__construct()
         msg_constructor = None
@@ -2372,8 +2372,8 @@ class TestIssueA_ConstructorPromotionResolution:
         call_id = calls[0]
 
         # Test param name and FQN resolution for position 0
-        param_name = query._resolve_param_name(call_id, 0)
-        param_fqn = query._resolve_param_fqn(call_id, 0)
+        param_name = resolve_param_name(index, call_id, 0)
+        param_fqn = resolve_param_fqn(index, call_id, 0)
 
         assert param_name == "$orderId"
         assert param_fqn == "App\\Ui\\Messenger\\Message\\OrderCreatedMessage::$orderId"

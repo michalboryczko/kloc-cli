@@ -23,6 +23,14 @@ from .results import (
     OverridesResult,
     DefinitionInfo,
 )
+from .output import (
+    ContextOutput,
+    OutputTarget,
+    OutputEntry,
+    OutputMemberRef,
+    OutputArgumentInfo,
+    OutputDefinition,
+)
 
 __all__ = [
     "NodeData",
@@ -46,4 +54,10 @@ __all__ = [
     "OverridesTreeResult",
     "OverridesResult",
     "DefinitionInfo",
+    "ContextOutput",
+    "OutputTarget",
+    "OutputEntry",
+    "OutputMemberRef",
+    "OutputArgumentInfo",
+    "OutputDefinition",
 ]
