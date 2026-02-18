@@ -48,18 +48,24 @@ class PrecomputedGraph:
             elif edge.type == "contains":
                 graph.contains[edge.source] = edge.target
 
-        # Second pass: compute transitive closures
-        graph._compute_inheritance_closures(nodes)
-        graph._compute_interface_closures(nodes)
-        graph._compute_override_closures(nodes)
+        # Pre-filter by kind for targeted computation
+        type_node_ids = {nid for nid, n in nodes.items()
+                         if n.kind in ("Class", "Interface", "Trait", "Enum")}
+        method_node_ids = {nid for nid, n in nodes.items()
+                           if n.kind == "Method"}
+
+        # Second pass: compute transitive closures (filtered)
+        graph._compute_inheritance_closures(nodes, type_node_ids)
+        graph._compute_interface_closures(nodes, type_node_ids)
+        graph._compute_override_closures(nodes, method_node_ids)
         graph._compute_containment_paths(nodes)
 
         return graph
 
-    def _compute_inheritance_closures(self, nodes: dict[str, NodeData]):
-        """Compute ancestor and descendant chains for all classes."""
-        # Compute ancestors (upward traversal)
-        for node_id in nodes:
+    def _compute_inheritance_closures(self, nodes: dict[str, NodeData], type_node_ids: set[str]):
+        """Compute ancestor and descendant chains for type nodes (Class/Interface/Trait/Enum)."""
+        # Compute ancestors (upward traversal) — only for type nodes
+        for node_id in type_node_ids:
             if node_id not in self.ancestors:
                 self.ancestors[node_id] = self._get_ancestors(node_id)
 
@@ -72,11 +78,6 @@ class PrecomputedGraph:
         # Convert to lists and sort for determinism
         for node_id, desc_set in descendants_sets.items():
             self.descendants[node_id] = sorted(desc_set)
-
-        # Ensure all nodes have an entry (even if empty)
-        for node_id in nodes:
-            if node_id not in self.descendants:
-                self.descendants[node_id] = []
 
     def _get_ancestors(self, node_id: str) -> list[str]:
         """Get all ancestors of a node (memoized)."""
@@ -97,9 +98,9 @@ class PrecomputedGraph:
 
         return ancestors
 
-    def _compute_interface_closures(self, nodes: dict[str, NodeData]):
-        """Compute all interfaces (including inherited) for each class."""
-        for node_id in nodes:
+    def _compute_interface_closures(self, nodes: dict[str, NodeData], type_node_ids: set[str]):
+        """Compute all interfaces (including inherited) for type nodes."""
+        for node_id in type_node_ids:
             all_interfaces: set[str] = set()
 
             # Direct implementations
@@ -111,49 +112,48 @@ class PrecomputedGraph:
 
             self.all_interfaces[node_id] = all_interfaces
 
-    def _compute_override_closures(self, nodes: dict[str, NodeData]):
-        """Compute override chains and roots for all methods."""
+    def _compute_override_closures(self, nodes: dict[str, NodeData], method_node_ids: set[str]):
+        """Compute override chains and roots for Method nodes only."""
         # Build reverse mapping for override_chain_down
         overridden_by: dict[str, list[str]] = defaultdict(list)
         for method_id, parent_id in self.overrides.items():
             overridden_by[parent_id].append(method_id)
 
-        # Compute upward chains and roots
-        for method_id in nodes:
-            if nodes[method_id].kind == "Method":
-                chain_up = []
-                current = method_id
-                root = method_id
+        # Compute upward chains and roots — only for Method nodes
+        for method_id in method_node_ids:
+            chain_up = []
+            current = method_id
+            root = method_id
 
-                while current in self.overrides:
-                    parent = self.overrides[current]
-                    chain_up.append(parent)
-                    root = parent
-                    current = parent
+            while current in self.overrides:
+                parent = self.overrides[current]
+                chain_up.append(parent)
+                root = parent
+                current = parent
 
-                self.override_chain_up[method_id] = chain_up
-                self.override_root[method_id] = root
+            self.override_chain_up[method_id] = chain_up
+            self.override_root[method_id] = root
 
         # Compute downward chains (BFS from each method)
-        for method_id in nodes:
-            if nodes[method_id].kind == "Method":
-                chain_down = []
-                to_visit = [method_id]
-                visited = {method_id}
+        for method_id in method_node_ids:
+            chain_down = []
+            to_visit = [method_id]
+            visited = {method_id}
 
-                while to_visit:
-                    current = to_visit.pop(0)
-                    for child in overridden_by.get(current, []):
-                        if child not in visited:
-                            visited.add(child)
-                            chain_down.append(child)
-                            to_visit.append(child)
+            while to_visit:
+                current = to_visit.pop(0)
+                for child in overridden_by.get(current, []):
+                    if child not in visited:
+                        visited.add(child)
+                        chain_down.append(child)
+                        to_visit.append(child)
 
-                self.override_chain_down[method_id] = chain_down
+            self.override_chain_down[method_id] = chain_down
 
     def _compute_containment_paths(self, nodes: dict[str, NodeData]):
-        """Compute containment paths for all nodes."""
-        for node_id in nodes:
+        """Compute containment paths for nodes that have containment edges."""
+        # Only process nodes that appear in the contains dict (have a parent)
+        for node_id in self.contains:
             path = [node_id]
             current = node_id
 

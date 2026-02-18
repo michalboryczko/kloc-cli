@@ -35,3 +35,6 @@ Thumbs.db
 
 # Lock files (regenerated)
 uv.lock
+
+# Binary cache (generated from sot.json)
+.sot.cache

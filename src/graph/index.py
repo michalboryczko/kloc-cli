@@ -4,9 +4,10 @@ from pathlib import Path
 from collections import defaultdict
 from typing import Optional
 
-from .loader import load_sot
+from .loader import load_sot, NodeSpec, EdgeSpec
 from .precompute import PrecomputedGraph
 from .trie import SymbolTrie, build_symbol_trie
+from .cache import read_cache, write_cache, get_cache_path
 from ..models import NodeData, EdgeData
 
 
@@ -19,18 +20,47 @@ class SoTIndex:
     # Node kinds that are internal graph nodes, not user-searchable symbols
     _INTERNAL_KINDS = frozenset({"Call", "Value", "Argument"})
 
-    def __init__(self, sot_path: str | Path, precompute: bool = True):
+    def __init__(self, sot_path: str | Path, precompute: bool = True, use_cache: bool = True):
         """Initialize the index.
 
         Args:
             sot_path: Path to the SoT JSON file.
             precompute: Whether to build precomputed closures (default True).
+            use_cache: Whether to use binary cache for faster loads (default True).
         """
         self.sot_path = Path(sot_path)
         self._precompute_enabled = precompute
         self._trie: Optional[SymbolTrie] = None
+
+        # Try cache first
+        if use_cache:
+            cache_path = get_cache_path(self.sot_path)
+            cached = read_cache(cache_path, self.sot_path)
+            if cached is not None:
+                self._restore_from_cache(cached)
+                return
+
+        # Cache miss — build from scratch
         self._load()
         self._build_indexes()
+
+        # Write cache for next time
+        if use_cache:
+            write_cache(self.sot_path, self)
+
+    def _restore_from_cache(self, cached: dict):
+        """Restore index state from cached data."""
+        self.version = cached["version"]
+        self.metadata = cached["metadata"]
+        self.nodes = cached["nodes"]
+        self.edges = cached["edges"]
+        self.symbol_to_id = cached["symbol_to_id"]
+        self.fqn_to_ids = defaultdict(list, cached["fqn_to_ids"])
+        self.name_to_ids = defaultdict(list, cached["name_to_ids"])
+        self.outgoing = defaultdict(dict, cached["outgoing"])
+        self.incoming = defaultdict(dict, cached["incoming"])
+        self.edges_by_parameter = defaultdict(list, cached["edges_by_parameter"])
+        self._precomputed = cached.get("precomputed")
 
     def _load(self):
         """Load SoT JSON from file."""
@@ -39,36 +69,10 @@ class SoTIndex:
         self.version = data.version
         self.metadata = data.metadata
 
-        self.nodes: dict[str, NodeData] = {}
-        for n in data.nodes:
-            node = NodeData(
-                id=n.id,
-                kind=n.kind,
-                name=n.name,
-                fqn=n.fqn,
-                symbol=n.symbol,
-                file=n.file,
-                range=n.range,
-                documentation=n.documentation,
-                # v2.0 fields
-                value_kind=n.value_kind,
-                type_symbol=n.type_symbol,
-                call_kind=n.call_kind,
-            )
-            self.nodes[node.id] = node
-
-        self.edges: list[EdgeData] = []
-        for e in data.edges:
-            edge = EdgeData(
-                type=e.type,
-                source=e.source,
-                target=e.target,
-                location=e.location,
-                position=e.position,
-                expression=e.expression,
-                parameter=e.parameter,
-            )
-            self.edges.append(edge)
+        # Store NodeSpec/EdgeSpec directly — no conversion needed
+        # (NodeData and EdgeData are now aliases for NodeSpec and EdgeSpec)
+        self.nodes: dict[str, NodeData] = {n.id: n for n in data.nodes}
+        self.edges: list[EdgeData] = data.edges
 
     def _build_indexes(self):
         """Build lookup indexes."""
@@ -82,9 +86,7 @@ class SoTIndex:
         for node_id, node in self.nodes.items():
             self.symbol_to_id[node.symbol] = node_id
             self.fqn_to_ids[node.fqn].append(node_id)
-            self.fqn_to_ids[node.fqn.lower()].append(node_id)  # case-insensitive
             self.name_to_ids[node.name].append(node_id)
-            self.name_to_ids[node.name.lower()].append(node_id)
 
         # Edge indexes by node ID
         # Use defaultdict(dict) instead of defaultdict(lambda: defaultdict(list))
@@ -92,15 +94,24 @@ class SoTIndex:
         self.outgoing: dict[str, dict[str, list[EdgeData]]] = defaultdict(dict)
         self.incoming: dict[str, dict[str, list[EdgeData]]] = defaultdict(dict)
 
+        # Parameter edge index for fast argument lookups by parameter FQN
+        self.edges_by_parameter: dict[str, list[EdgeData]] = defaultdict(list)
+
         for edge in self.edges:
             self.outgoing[edge.source].setdefault(edge.type, []).append(edge)
             self.incoming[edge.target].setdefault(edge.type, []).append(edge)
+            if edge.type == "argument" and edge.parameter:
+                self.edges_by_parameter[edge.parameter].append(edge)
 
-        # Build precomputed graph (transitive closures)
-        if self._precompute_enabled:
-            self.precomputed = PrecomputedGraph.build(self.nodes, self.edges)
-        else:
-            self.precomputed = None
+        # Precomputed graph is built lazily on first access
+        self._precomputed: Optional[PrecomputedGraph] = None
+
+    @property
+    def precomputed(self) -> Optional[PrecomputedGraph]:
+        """Lazy-built precomputed graph. Only constructed on first transitive closure query."""
+        if self._precomputed is None and self._precompute_enabled:
+            self._precomputed = PrecomputedGraph.build(self.nodes, self.edges)
+        return self._precomputed
 
     @property
     def trie(self) -> Optional[SymbolTrie]:
@@ -141,11 +152,13 @@ class SoTIndex:
                     candidates = [n for n in candidates if n.kind != "Argument"]
             return candidates
 
-        # Try case-insensitive FQN
+        # Try case-insensitive FQN (on-demand scan)
         query_lower = query_normalized.lower()
-        if query_lower in self.fqn_to_ids:
-            for node_id in self.fqn_to_ids[query_lower]:
-                add_candidate(self.nodes[node_id])
+        for fqn, node_ids in self.fqn_to_ids.items():
+            if fqn.lower() == query_lower:
+                for node_id in node_ids:
+                    add_candidate(self.nodes[node_id])
+        if candidates:
             return candidates
 
         # Use trie for faster partial matching if available
