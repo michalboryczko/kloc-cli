@@ -16,6 +16,9 @@ class SoTIndex:
     Includes precomputed transitive closures and symbol trie for O(1) queries.
     """
 
+    # Node kinds that are internal graph nodes, not user-searchable symbols
+    _INTERNAL_KINDS = frozenset({"Call", "Value", "Argument"})
+
     def __init__(self, sot_path: str | Path, precompute: bool = True):
         """Initialize the index.
 
@@ -25,6 +28,7 @@ class SoTIndex:
         """
         self.sot_path = Path(sot_path)
         self._precompute_enabled = precompute
+        self._trie: Optional[SymbolTrie] = None
         self._load()
         self._build_indexes()
 
@@ -32,38 +36,37 @@ class SoTIndex:
         """Load SoT JSON from file."""
         data = load_sot(self.sot_path)
 
-        self.version = data.get("version", "1.0")
-        self.metadata = data.get("metadata", {})
+        self.version = data.version
+        self.metadata = data.metadata
 
         self.nodes: dict[str, NodeData] = {}
-        for n in data.get("nodes", []):
+        for n in data.nodes:
             node = NodeData(
-                id=n["id"],
-                kind=n["kind"],
-                name=n["name"],
-                fqn=n["fqn"],
-                symbol=n["symbol"],
-                file=n.get("file"),
-                range=n.get("range"),
-                enclosing_range=n.get("enclosing_range"),
-                documentation=n.get("documentation", []),
+                id=n.id,
+                kind=n.kind,
+                name=n.name,
+                fqn=n.fqn,
+                symbol=n.symbol,
+                file=n.file,
+                range=n.range,
+                documentation=n.documentation,
                 # v2.0 fields
-                value_kind=n.get("value_kind"),
-                type_symbol=n.get("type_symbol"),
-                call_kind=n.get("call_kind"),
+                value_kind=n.value_kind,
+                type_symbol=n.type_symbol,
+                call_kind=n.call_kind,
             )
             self.nodes[node.id] = node
 
         self.edges: list[EdgeData] = []
-        for e in data.get("edges", []):
+        for e in data.edges:
             edge = EdgeData(
-                type=e["type"],
-                source=e["source"],
-                target=e["target"],
-                location=e.get("location"),
-                position=e.get("position"),
-                expression=e.get("expression"),
-                parameter=e.get("parameter"),
+                type=e.type,
+                source=e.source,
+                target=e.target,
+                location=e.location,
+                position=e.position,
+                expression=e.expression,
+                parameter=e.parameter,
             )
             self.edges.append(edge)
 
@@ -84,24 +87,27 @@ class SoTIndex:
             self.name_to_ids[node.name.lower()].append(node_id)
 
         # Edge indexes by node ID
-        self.outgoing: dict[str, dict[str, list[EdgeData]]] = defaultdict(
-            lambda: defaultdict(list)
-        )
-        self.incoming: dict[str, dict[str, list[EdgeData]]] = defaultdict(
-            lambda: defaultdict(list)
-        )
+        # Use defaultdict(dict) instead of defaultdict(lambda: defaultdict(list))
+        # to avoid lambda call overhead for 260K+ edges
+        self.outgoing: dict[str, dict[str, list[EdgeData]]] = defaultdict(dict)
+        self.incoming: dict[str, dict[str, list[EdgeData]]] = defaultdict(dict)
 
         for edge in self.edges:
-            self.outgoing[edge.source][edge.type].append(edge)
-            self.incoming[edge.target][edge.type].append(edge)
+            self.outgoing[edge.source].setdefault(edge.type, []).append(edge)
+            self.incoming[edge.target].setdefault(edge.type, []).append(edge)
 
         # Build precomputed graph (transitive closures)
         if self._precompute_enabled:
             self.precomputed = PrecomputedGraph.build(self.nodes, self.edges)
-            self.trie = build_symbol_trie(self.nodes)
         else:
             self.precomputed = None
-            self.trie = None
+
+    @property
+    def trie(self) -> Optional[SymbolTrie]:
+        """Lazy-built symbol trie. Only constructed on first fuzzy search."""
+        if self._trie is None and self._precompute_enabled:
+            self._trie = build_symbol_trie(self.nodes, skip_kinds=self._INTERNAL_KINDS)
+        return self._trie
 
     def resolve_symbol(self, query: str) -> list[NodeData]:
         """Resolve a symbol query to matching nodes.

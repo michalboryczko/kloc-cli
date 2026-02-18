@@ -71,58 +71,24 @@ class SoTSpec(msgspec.Struct, omit_defaults=True):
 _decoder = msgspec.json.Decoder(SoTSpec)
 
 
-def load_sot(path: str | Path) -> dict[str, Any]:
+def load_sot(path: str | Path) -> SoTSpec:
     """Load SoT JSON from file.
 
     Uses msgspec for fast parsing (~5-10x faster than stdlib json).
+    Returns the typed SoTSpec struct directly to avoid intermediate dict creation.
 
     Args:
         path: Path to the SoT JSON file.
 
     Returns:
-        Parsed JSON data as a dictionary.
+        Parsed SoTSpec struct.
 
     Raises:
         FileNotFoundError: If the file doesn't exist.
         msgspec.DecodeError: If the file is not valid JSON.
     """
     with open(path, "rb") as f:
-        data = _decoder.decode(f.read())
-
-    # Convert to dict format expected by the rest of the codebase
-    return {
-        "version": data.version,
-        "metadata": data.metadata,
-        "nodes": [
-            {
-                "id": n.id,
-                "kind": n.kind,
-                "name": n.name,
-                "fqn": n.fqn,
-                "symbol": n.symbol,
-                "file": n.file,
-                "range": n.range,
-                "documentation": n.documentation,
-                # v2.0 fields
-                "value_kind": n.value_kind,
-                "type_symbol": n.type_symbol,
-                "call_kind": n.call_kind,
-            }
-            for n in data.nodes
-        ],
-        "edges": [
-            {
-                "type": e.type,
-                "source": e.source,
-                "target": e.target,
-                "location": e.location,
-                "position": e.position,
-                "expression": e.expression,
-                "parameter": e.parameter,
-            }
-            for e in data.edges
-        ],
-    }
+        return _decoder.decode(f.read())
 
 
 def load_sot_raw(path: str | Path) -> SoTSpec:

@@ -187,11 +187,15 @@ class SymbolTrie:
             self._collect_ids(child, results, limit)
 
 
-def build_symbol_trie(nodes: dict[str, "NodeData"]) -> SymbolTrie:
+def build_symbol_trie(
+    nodes: dict[str, "NodeData"],
+    skip_kinds: frozenset[str] | None = None,
+) -> SymbolTrie:
     """Build a symbol trie from a dictionary of nodes.
 
     Args:
         nodes: Dictionary mapping node IDs to NodeData
+        skip_kinds: Node kinds to exclude (e.g. internal Call/Value/Argument nodes)
 
     Returns:
         Populated SymbolTrie
@@ -199,6 +203,8 @@ def build_symbol_trie(nodes: dict[str, "NodeData"]) -> SymbolTrie:
     trie = SymbolTrie()
 
     for node_id, node in nodes.items():
+        if skip_kinds and node.kind in skip_kinds:
+            continue
         # Add FQN
         trie.add(node.fqn, node_id)
         # Also add short name for quick lookups
