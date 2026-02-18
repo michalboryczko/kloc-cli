@@ -712,7 +712,7 @@ def build_injection_point_calls(
         return []
 
     entries = []
-    seen_callees: set[str] = set()
+    entries_by_fqn: dict[str, ContextEntry] = {}
 
     # Find all Call nodes in the containing class's methods that use this property as receiver
     for method_child_id in index.get_contains_children(containing_class_id):
@@ -750,17 +750,13 @@ def build_injection_point_calls(
 
             # Dedup: same callee method, collect as sites
             callee_key = target_node.fqn
-            if callee_key in seen_callees:
-                # Find existing entry and add site
-                for existing in entries:
-                    if existing.fqn == target_node.fqn:
-                        if existing.sites is None:
-                            existing.sites = [{"method": method_node.name, "line": existing.line}]
-                            existing.line = None
-                        existing.sites.append({"method": method_node.name, "line": call_line})
-                        break
+            if callee_key in entries_by_fqn:
+                existing = entries_by_fqn[callee_key]
+                if existing.sites is None:
+                    existing.sites = [{"method": method_node.name, "line": existing.line}]
+                    existing.line = None
+                existing.sites.append({"method": method_node.name, "line": call_line})
                 continue
-            seen_callees.add(callee_key)
 
             # ISSUE-H: crossed_from the containing class (depth-1 property_type entry)
             containing_cls_node = index.nodes.get(containing_class_id)
@@ -810,6 +806,7 @@ def build_injection_point_calls(
                         )]
 
             entries.append(entry)
+            entries_by_fqn[callee_key] = entry
 
     entries.sort(key=lambda e: (e.file or "", e.line if e.line is not None else 0))
     return entries
@@ -883,7 +880,8 @@ def build_class_uses(
 
     # Pre-collect type_hint edges from class members to classify targets accurately
     type_hint_info: dict[str, dict] = {}
-    for child_id in index.get_contains_children(start_id):
+    children = index.get_contains_children(start_id)
+    for child_id in children:
         child = index.nodes.get(child_id)
         if not child:
             continue
@@ -934,7 +932,7 @@ def build_class_uses(
 
     # Pre-collect constructor calls to detect instantiation targets
     instantiation_targets: dict[str, dict] = {}
-    for child_id in index.get_contains_children(start_id):
+    for child_id in children:
         child = index.nodes.get(child_id)
         if not child or child.kind != "Method":
             continue

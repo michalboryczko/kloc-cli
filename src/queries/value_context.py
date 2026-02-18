@@ -737,14 +737,8 @@ def build_parameter_uses(
     entries = []
     param_fqn = param_node.fqn
 
-    # Search argument edges where parameter field matches this FQN
-    for edge in index.edges:
-        if edge.type != "argument":
-            continue
-        if edge.parameter != param_fqn:
-            continue
-
-        # Found a caller's argument edge
+    # Search argument edges where parameter field matches this FQN (O(1) index lookup)
+    for edge in index.edges_by_parameter.get(param_fqn, []):
         caller_call_id = edge.source  # Call node in the caller
         caller_value_id = edge.target  # Value passed by the caller
 
