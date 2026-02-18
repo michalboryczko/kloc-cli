@@ -45,7 +45,12 @@ class SoTIndex:
                 symbol=n["symbol"],
                 file=n.get("file"),
                 range=n.get("range"),
+                enclosing_range=n.get("enclosing_range"),
                 documentation=n.get("documentation", []),
+                # v2.0 fields
+                value_kind=n.get("value_kind"),
+                type_symbol=n.get("type_symbol"),
+                call_kind=n.get("call_kind"),
             )
             self.nodes[node.id] = node
 
@@ -56,6 +61,9 @@ class SoTIndex:
                 source=e["source"],
                 target=e["target"],
                 location=e.get("location"),
+                position=e.get("position"),
+                expression=e.get("expression"),
+                parameter=e.get("parameter"),
             )
             self.edges.append(edge)
 
@@ -120,6 +128,11 @@ class SoTIndex:
         if query_normalized in self.fqn_to_ids:
             for node_id in self.fqn_to_ids[query_normalized]:
                 add_candidate(self.nodes[node_id])
+            # When Value and Argument nodes share the same FQN, keep only Value
+            if len(candidates) > 1:
+                has_value = any(n.kind == "Value" for n in candidates)
+                if has_value:
+                    candidates = [n for n in candidates if n.kind != "Argument"]
             return candidates
 
         # Try case-insensitive FQN
@@ -218,6 +231,35 @@ class SoTIndex:
             return all_usages
 
         return direct_usages
+
+    def get_usages_grouped(self, node_id: str) -> dict[str, list[EdgeData]]:
+        """Get all incoming uses edges for a node and its members, grouped by source.
+
+        Unlike get_usages(), does NOT deduplicate by source - returns all edges
+        so callers can see every member reference from each source.
+
+        Returns:
+            Dict mapping source_id -> list of EdgeData (may target the node
+            itself or any of its contained members).
+        """
+        grouped: dict[str, list[EdgeData]] = defaultdict(list)
+
+        # Direct usages of the node itself
+        for edge in self.incoming[node_id].get("uses", []):
+            grouped[edge.source].append(edge)
+
+        # Member usages (for container types)
+        node = self.nodes.get(node_id)
+        if node and node.kind in ("Class", "Interface", "Trait", "Enum", "File"):
+            def collect_member_edges(parent_id: str):
+                for child_id in self.get_contains_children(parent_id):
+                    for edge in self.incoming[child_id].get("uses", []):
+                        grouped[edge.source].append(edge)
+                    collect_member_edges(child_id)
+
+            collect_member_edges(node_id)
+
+        return dict(grouped)
 
     def get_deps(self, node_id: str, include_members: bool = True) -> list[EdgeData]:
         """Get all outgoing 'uses' edges from a node.
@@ -364,3 +406,110 @@ class SoTIndex:
             path.append(parent)
             current = parent
         return list(reversed(path))
+
+    # =========================================================================
+    # v2.0 Edge Query Methods (Value/Call graph traversal)
+    # =========================================================================
+
+    def get_receiver(self, call_node_id: str) -> Optional[str]:
+        """Get the receiver Value node ID for a Call node."""
+        edges = self.outgoing[call_node_id].get("receiver", [])
+        if edges:
+            return edges[0].target
+        return None
+
+    def get_call_target(self, call_node_id: str) -> Optional[str]:
+        """Get the target (callee) node ID for a Call node."""
+        edges = self.outgoing[call_node_id].get("calls", [])
+        if edges:
+            return edges[0].target
+        return None
+
+    def get_produces(self, call_node_id: str) -> Optional[str]:
+        """Get the result Value node ID produced by a Call node."""
+        edges = self.outgoing[call_node_id].get("produces", [])
+        if edges:
+            return edges[0].target
+        return None
+
+    def get_source_call(self, value_node_id: str) -> Optional[str]:
+        """Get the Call node ID that produced this Value node (via produces edge)."""
+        edges = self.incoming[value_node_id].get("produces", [])
+        if edges:
+            return edges[0].source
+        return None
+
+    def get_assigned_from(self, value_node_id: str) -> Optional[str]:
+        """Get the source Value node ID for a value assignment."""
+        edges = self.outgoing[value_node_id].get("assigned_from", [])
+        if edges:
+            return edges[0].target
+        return None
+
+    def get_type_of(self, value_node_id: str) -> Optional[str]:
+        """Get the type (Class/Interface) node ID for a Value node."""
+        edges = self.outgoing[value_node_id].get("type_of", [])
+        if edges:
+            return edges[0].target
+        return None
+
+    def get_type_of_all(self, value_node_id: str) -> list[str]:
+        """Get all type (Class/Interface) node IDs for a Value node (supports union types)."""
+        return [e.target for e in self.outgoing[value_node_id].get("type_of", [])]
+
+    def get_calls_to(self, target_node_id: str) -> list[str]:
+        """Get all Call node IDs that call a given Method/Property/Class."""
+        return [e.source for e in self.incoming[target_node_id].get("calls", [])]
+
+    def resolve_file_to_class(self, file_node_id: str) -> Optional[str]:
+        """Resolve a File node to its primary contained Class/Interface/Trait/Enum (R6).
+
+        Resolution rules:
+        - Single class -> use that class
+        - Multiple classes -> use the one whose name matches the filename (PSR-4)
+        - No class (script file) -> return None (caller keeps file path)
+
+        Args:
+            file_node_id: ID of the File node.
+
+        Returns:
+            Node ID of the primary class, or None if no class found.
+        """
+        file_node = self.nodes.get(file_node_id)
+        if not file_node or file_node.kind != "File":
+            return None
+
+        children = self.get_contains_children(file_node_id)
+        class_children = []
+        for child_id in children:
+            child_node = self.nodes.get(child_id)
+            if child_node and child_node.kind in ("Class", "Interface", "Trait", "Enum"):
+                class_children.append(child_id)
+
+        if not class_children:
+            return None
+
+        if len(class_children) == 1:
+            return class_children[0]
+
+        # Multiple classes: find the one matching the filename (PSR-4 convention)
+        if file_node.file:
+            import os
+            filename = os.path.splitext(os.path.basename(file_node.file))[0]
+            for child_id in class_children:
+                child_node = self.nodes.get(child_id)
+                if child_node and child_node.name == filename:
+                    return child_id
+
+        # Fallback: return the first class
+        return class_children[0]
+
+    def get_arguments(self, call_node_id: str) -> list[tuple[str, int, Optional[str], Optional[str]]]:
+        """Get argument Value node IDs with their positions for a Call node.
+
+        Returns:
+            List of (value_node_id, position, expression, parameter) tuples sorted by position.
+        """
+        edges = self.outgoing[call_node_id].get("argument", [])
+        args = [(e.target, e.position or 0, e.expression, e.parameter) for e in edges]
+        return sorted(args, key=lambda x: x[1])

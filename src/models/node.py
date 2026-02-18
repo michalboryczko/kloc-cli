@@ -15,7 +15,15 @@ class NodeData:
     symbol: str
     file: Optional[str]
     range: Optional[dict]
+    enclosing_range: Optional[dict] = None
     documentation: list[str] = field(default_factory=list)
+
+    # Value node fields (only set when kind == "Value")
+    value_kind: Optional[str] = None    # "parameter", "local", "result", "literal", "constant"
+    type_symbol: Optional[str] = None   # SCIP symbol of the value's type
+
+    # Call node fields (only set when kind == "Call")
+    call_kind: Optional[str] = None     # "method", "method_static", "constructor", "access", "access_static", "function"
 
     @property
     def start_line(self) -> Optional[int]:
@@ -40,10 +48,16 @@ class NodeData:
         Examples:
         - ```php\npublic function getName(): string\n```
         - public function setName(string $name): void
+        - public function create(#[\\Symfony\\...\\MapRequestPayload] CreateOrderRequest $request): JsonResponse
 
         Returns the clean signature without visibility modifiers, e.g.:
         - setName(string $name): void
         - getName(): string
+        - create(CreateOrderRequest $request): JsonResponse
+
+        R5: Handles PHP attributes (#[...]) by stripping them from parameters.
+        If the signature appears truncated (missing closing paren), falls back to
+        method_name(...) shorthand.
         """
         import re
 
@@ -55,17 +69,50 @@ class NodeData:
             clean = doc.replace("```php", "").replace("```", "").strip()
             # Look for function signature
             if "function " in clean:
-                # Extract just the signature line
+                # Extract just the signature line(s) -- may span multiple lines
+                # when attributes push content to the next line
+                sig_lines = []
+                capturing = False
                 for line in clean.split("\n"):
                     line = line.strip()
                     if "function " in line:
-                        # Remove visibility modifiers (public, protected, private, static, final, abstract)
-                        line = re.sub(
-                            r'^(?:public\s+|protected\s+|private\s+|static\s+|final\s+|abstract\s+)*function\s+',
-                            '',
-                            line
-                        )
-                        return line
+                        capturing = True
+                    if capturing:
+                        sig_lines.append(line)
+                        # Stop capturing once we have a complete signature
+                        # (has closing paren and optional return type)
+                        if ")" in line:
+                            break
+
+                if not sig_lines:
+                    continue
+
+                full_sig = " ".join(sig_lines)
+
+                # Remove visibility modifiers (public, protected, private, static, final, abstract)
+                full_sig = re.sub(
+                    r'^(?:public\s+|protected\s+|private\s+|static\s+|final\s+|abstract\s+)*function\s+',
+                    '',
+                    full_sig
+                )
+
+                # R5: Strip PHP attributes (#[...]) from parameters
+                # Attributes can be nested: #[Attr(args)] or #[Attr]
+                full_sig = re.sub(r'#\[[^\]]*\]\s*', '', full_sig)
+
+                # Clean up any double spaces left after attribute removal
+                full_sig = re.sub(r'\s+', ' ', full_sig).strip()
+
+                # Validate the signature is well-formed (has matching parens)
+                if "(" in full_sig and ")" in full_sig:
+                    return full_sig
+
+                # If signature is malformed (missing closing paren), use shorthand
+                if "(" in full_sig:
+                    method_name = full_sig.split("(")[0]
+                    return f"{method_name}(...)"
+
+                return full_sig
         return None
 
     @property

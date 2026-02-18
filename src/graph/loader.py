@@ -38,6 +38,13 @@ class NodeSpec(msgspec.Struct, omit_defaults=True):
     range: Optional[dict] = None  # Keep as dict for compatibility
     documentation: list[str] = []
 
+    # Value node fields (sot.json v2.0)
+    value_kind: Optional[str] = None    # "parameter", "local", "result", "literal", "constant"
+    type_symbol: Optional[str] = None   # SCIP symbol of the value's type
+
+    # Call node fields (sot.json v2.0)
+    call_kind: Optional[str] = None     # "method", "method_static", "constructor", etc.
+
 
 class EdgeSpec(msgspec.Struct, omit_defaults=True):
     """Edge specification in SoT JSON."""
@@ -46,6 +53,9 @@ class EdgeSpec(msgspec.Struct, omit_defaults=True):
     source: str
     target: str
     location: Optional[dict] = None  # Keep as dict for compatibility
+    position: Optional[int] = None   # For argument edges: 0-based argument index
+    expression: Optional[str] = None  # For argument edges: source expression text
+    parameter: Optional[str] = None  # For argument edges: formal parameter FQN
 
 
 class SoTSpec(msgspec.Struct, omit_defaults=True):
@@ -93,6 +103,10 @@ def load_sot(path: str | Path) -> dict[str, Any]:
                 "file": n.file,
                 "range": n.range,
                 "documentation": n.documentation,
+                # v2.0 fields
+                "value_kind": n.value_kind,
+                "type_symbol": n.type_symbol,
+                "call_kind": n.call_kind,
             }
             for n in data.nodes
         ],
@@ -102,6 +116,9 @@ def load_sot(path: str | Path) -> dict[str, Any]:
                 "source": e.source,
                 "target": e.target,
                 "location": e.location,
+                "position": e.position,
+                "expression": e.expression,
+                "parameter": e.parameter,
             }
             for e in data.edges
         ],

@@ -296,9 +296,91 @@ class MCPServer:
                 d["signature"] = e.signature
             if e.implementations:
                 d["implementations"] = [entry_to_dict(i) for i in e.implementations]
+            if e.via_interface:
+                d["via_interface"] = True
+            if e.member_ref:
+                mr = {
+                    "target_name": e.member_ref.target_name,
+                    "target_fqn": e.member_ref.target_fqn,
+                    "target_kind": e.member_ref.target_kind,
+                    "file": e.member_ref.file,
+                    "line": e.member_ref.line + 1 if e.member_ref.line is not None else None,
+                }
+                if e.member_ref.reference_type:
+                    mr["reference_type"] = e.member_ref.reference_type
+                if e.member_ref.access_chain:
+                    mr["access_chain"] = e.member_ref.access_chain
+                if e.member_ref.access_chain_symbol:
+                    mr["access_chain_symbol"] = e.member_ref.access_chain_symbol
+                d["member_ref"] = mr
+            if e.arguments:
+                d["arguments"] = [
+                    {k: v for k, v in {
+                        "position": a.position, "param_name": a.param_name,
+                        "value_expr": a.value_expr, "value_source": a.value_source,
+                        "value_type": a.value_type, "param_fqn": a.param_fqn,
+                        "value_ref_symbol": a.value_ref_symbol, "source_chain": a.source_chain,
+                    }.items() if v is not None}
+                    for a in e.arguments
+                ]
+            if e.result_var:
+                d["result_var"] = e.result_var
+            if e.entry_type:
+                d["entry_type"] = e.entry_type
+            if e.variable_name:
+                d["variable_name"] = e.variable_name
+            if e.variable_symbol:
+                d["variable_symbol"] = e.variable_symbol
+            if e.variable_type:
+                d["variable_type"] = e.variable_type
+            if e.source_call:
+                d["source_call"] = entry_to_dict(e.source_call)
             return d
 
-        return {"target": {"fqn": result.target.fqn, "file": result.target.file}, "used_by": [entry_to_dict(e) for e in result.used_by], "uses": [entry_to_dict(e) for e in result.uses]}
+        response = {"target": {"fqn": result.target.fqn, "file": result.target.file}, "usedBy": [entry_to_dict(e) for e in result.used_by], "uses": [entry_to_dict(e) for e in result.uses]}
+
+        if result.definition:
+            defn = result.definition
+            defn_dict = {
+                "fqn": defn.fqn,
+                "kind": defn.kind,
+                "file": defn.file,
+                "line": defn.line + 1 if defn.line is not None else None,
+            }
+            if defn.signature:
+                defn_dict["signature"] = defn.signature
+            if defn.arguments:
+                defn_dict["arguments"] = defn.arguments
+            if defn.kind == "Property" and defn.return_type:
+                rt = defn.return_type
+                type_name = rt.get("name", rt.get("fqn"))
+                if type_name:
+                    defn_dict["type"] = type_name
+                if rt.get("visibility"):
+                    defn_dict["visibility"] = rt["visibility"]
+                if rt.get("promoted"):
+                    defn_dict["promoted"] = True
+                if rt.get("readonly"):
+                    defn_dict["readonly"] = True
+                if rt.get("static"):
+                    defn_dict["static"] = True
+            elif defn.return_type:
+                defn_dict["returnType"] = defn.return_type
+            if defn.declared_in and defn.kind not in ("Class", "Interface", "Trait", "Enum"):
+                defn_dict["declaredIn"] = defn.declared_in
+            if defn.properties:
+                defn_dict["properties"] = defn.properties
+            if defn.methods:
+                defn_dict["methods"] = defn.methods
+            if defn.extends:
+                defn_dict["extends"] = defn.extends
+            if defn.implements:
+                defn_dict["implements"] = defn.implements
+            if defn.uses_traits:
+                defn_dict["uses_traits"] = defn.uses_traits
+            response["definition"] = defn_dict
+
+        return response
 
     def _handle_owners(self, args: dict) -> dict:
         project = args.get("project")

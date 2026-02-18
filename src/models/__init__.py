@@ -10,6 +10,8 @@ from .results import (
     DepsEntry,
     DepsTreeResult,
     DepsResult,
+    MemberRef,
+    ArgumentInfo,
     ContextEntry,
     ContextResult,
     OwnersResult,
@@ -19,6 +21,15 @@ from .results import (
     OverrideEntry,
     OverridesTreeResult,
     OverridesResult,
+    DefinitionInfo,
+)
+from .output import (
+    ContextOutput,
+    OutputTarget,
+    OutputEntry,
+    OutputMemberRef,
+    OutputArgumentInfo,
+    OutputDefinition,
 )
 
 __all__ = [
@@ -31,6 +42,8 @@ __all__ = [
     "DepsEntry",
     "DepsTreeResult",
     "DepsResult",
+    "MemberRef",
+    "ArgumentInfo",
     "ContextEntry",
     "ContextResult",
     "OwnersResult",
@@ -40,4 +53,11 @@ __all__ = [
     "OverrideEntry",
     "OverridesTreeResult",
     "OverridesResult",
+    "DefinitionInfo",
+    "ContextOutput",
+    "OutputTarget",
+    "OutputEntry",
+    "OutputMemberRef",
+    "OutputArgumentInfo",
+    "OutputDefinition",
 ]
