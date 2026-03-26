@@ -44,6 +44,9 @@ class SoTIndex:
         self._load()
         self._build_indexes()
 
+        # Eagerly build precomputed graph so it gets included in the cache
+        _ = self.precomputed
+
         # Write cache for next time
         if use_cache:
             write_cache(self.sot_path, self)
@@ -161,7 +164,26 @@ class SoTIndex:
         if candidates:
             return candidates
 
-        # Use trie for faster partial matching if available
+        # Try short name match (O(1) dict lookup, before expensive trie)
+        short_name = (
+            query_normalized.split("::")[-1]
+            if "::" in query_normalized
+            else query_normalized
+        )
+        if short_name in self.name_to_ids:
+            for node_id in self.name_to_ids[short_name]:
+                add_candidate(self.nodes[node_id])
+            return candidates
+
+        # Try name with () stripped
+        short_name_no_parens = short_name.rstrip("()")
+        if short_name_no_parens in self.name_to_ids:
+            for node_id in self.name_to_ids[short_name_no_parens]:
+                add_candidate(self.nodes[node_id])
+            if candidates:
+                return candidates
+
+        # Use trie for fuzzy partial matching as last resort
         if self.trie is not None:
             # Try suffix search first (most common use case)
             suffix_ids = self.trie.search_suffix(query_normalized, limit=50)
@@ -184,26 +206,6 @@ class SoTIndex:
             if fqn.endswith(query_normalized) or fqn.endswith("::" + query_normalized):
                 for node_id in node_ids:
                     add_candidate(self.nodes[node_id])
-
-        if candidates:
-            return candidates
-
-        # Try short name match
-        short_name = (
-            query_normalized.split("::")[-1]
-            if "::" in query_normalized
-            else query_normalized
-        )
-        if short_name in self.name_to_ids:
-            for node_id in self.name_to_ids[short_name]:
-                add_candidate(self.nodes[node_id])
-            return candidates
-
-        # Try name with () stripped
-        short_name_no_parens = short_name.rstrip("()")
-        if short_name_no_parens in self.name_to_ids:
-            for node_id in self.name_to_ids[short_name_no_parens]:
-                add_candidate(self.nodes[node_id])
 
         return candidates
 

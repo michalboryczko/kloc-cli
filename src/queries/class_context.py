@@ -360,6 +360,41 @@ def build_class_used_by(
                         index, entry.node_id, iface_id, 2, max_depth
                     )
 
+    # If include_impl, also show usages of interfaces this class implements
+    impl_interface_entries = []
+    if include_impl:
+        interface_ids = index.get_all_interfaces(start_id)
+        for iface_id in interface_ids:
+            if iface_id in visited_sources:
+                continue
+            visited_sources.add(iface_id)
+
+            iface_node = index.nodes.get(iface_id)
+            if not iface_node:
+                continue
+
+            # Build usages of the interface using its own class_used_by (without impl to avoid recursion)
+            iface_usages = build_class_used_by(
+                index, iface_id, max_depth, limit,
+                include_impl=False,
+                caller_chain_for_method_fn=caller_chain_for_method_fn,
+                injection_point_calls_fn=injection_point_calls_fn,
+                interface_injection_point_calls_fn=interface_injection_point_calls_fn,
+            )
+            if iface_usages:
+                iface_entry = ContextEntry(
+                    depth=0,
+                    node_id=iface_id,
+                    fqn=iface_node.fqn,
+                    kind=iface_node.kind,
+                    file=iface_node.file,
+                    line=iface_node.start_line,
+                    signature=iface_node.signature,
+                    children=iface_usages,
+                    via_interface=True,
+                )
+                impl_interface_entries.append(iface_entry)
+
     # Combine in priority order
     all_entries = (
         bucket.instantiation
@@ -369,6 +404,7 @@ def build_class_used_by(
         + bucket.method_call
         + property_access_entries
         + bucket.param_return
+        + impl_interface_entries
     )
 
     return all_entries[:limit]

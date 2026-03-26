@@ -66,6 +66,7 @@ def get_index(sot: str) -> SoTIndex:
 def mcp_server_cmd(
     sot: Optional[Path] = typer.Option(None, "--sot", "-s", help="Path to single SoT JSON file"),
     config: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to config JSON with multiple projects"),
+    data_dir: Optional[Path] = typer.Option(None, "--data-dir", help="Data directory (auto-discovers {project}/sot.json)"),
 ):
     """Start MCP server for AI assistant integration (stdio).
 
@@ -77,13 +78,8 @@ def mcp_server_cmd(
     Multi-project mode (config file):
         kloc-cli mcp-server --config /path/to/kloc.json
 
-    Config file format:
-        {
-            "projects": [
-                {"name": "my-app", "sot": "/path/to/my-app-sot.json"},
-                {"name": "payments", "sot": "/path/to/payments-sot.json"}
-            ]
-        }
+    Auto-discovery mode:
+        kloc-cli mcp-server --data-dir /path/to/data
 
     Tools provided:
     - kloc_projects: List available projects
@@ -95,12 +91,12 @@ def mcp_server_cmd(
     - kloc_inherit: Show inheritance tree
     - kloc_overrides: Show method override tree
     """
-    if not sot and not config:
-        console.print("[red]Error: Either --sot or --config is required[/red]", err=True)
+    provided = sum(1 for x in [sot, config, data_dir] if x is not None)
+    if provided == 0:
+        console.print("[red]Error: One of --sot, --config, or --data-dir is required[/red]", err=True)
         raise typer.Exit(1)
-
-    if sot and config:
-        console.print("[red]Error: Cannot use both --sot and --config[/red]", err=True)
+    if provided > 1:
+        console.print("[red]Error: Use only one of --sot, --config, or --data-dir[/red]", err=True)
         raise typer.Exit(1)
 
     if sot and not sot.exists():
@@ -111,8 +107,16 @@ def mcp_server_cmd(
         console.print(f"[red]Error: Config file not found: {config}[/red]", err=True)
         raise typer.Exit(1)
 
+    if data_dir and not data_dir.is_dir():
+        console.print(f"[red]Error: Data directory not found: {data_dir}[/red]", err=True)
+        raise typer.Exit(1)
+
     from .server import run_mcp_server
-    run_mcp_server(config_path=str(config) if config else None, sot_path=str(sot) if sot else None)
+    run_mcp_server(
+        config_path=str(config) if config else None,
+        sot_path=str(sot) if sot else None,
+        data_dir=str(data_dir) if data_dir else None,
+    )
 
 
 # =============================================================================

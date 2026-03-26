@@ -449,9 +449,8 @@ class ContextQuery(Query[ContextResult]):
         # If include_impl, also build interface/implementation usages
         interface_entries = []
         if include_impl:
-            # Existing: concrete -> interface direction
-            # When querying a concrete method, also show callers of the interface method
-            interface_method_ids = get_interface_method_ids(self.index,start_id)
+            # For methods: find interface methods this method implements
+            interface_method_ids = get_interface_method_ids(self.index, start_id)
             for iface_id in interface_method_ids:
                 if iface_id in visited:
                     continue
@@ -466,9 +465,8 @@ class ContextQuery(Query[ContextResult]):
 
                 # Only add if there are actual usages
                 if iface_usages:
-                    # Create an entry for the interface method itself
                     iface_entry = ContextEntry(
-                        depth=0,  # Special depth for grouping entry
+                        depth=0,
                         node_id=iface_id,
                         fqn=iface_node.fqn,
                         kind=iface_node.kind,
@@ -476,7 +474,7 @@ class ContextQuery(Query[ContextResult]):
                         line=iface_node.start_line,
                         signature=iface_node.signature,
                         children=iface_usages,
-                        via_interface=True,  # Mark as interface grouping
+                        via_interface=True,
                     )
                     interface_entries.append(iface_entry)
 

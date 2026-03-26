@@ -44,22 +44,25 @@ def _count_tree_nodes(entries: list) -> int:
 class MCPServer:
     """MCP server for kloc-cli with multi-project support."""
 
-    def __init__(self, config_path: Optional[str] = None, sot_path: Optional[str] = None):
-        """Initialize server with config file or single SoT path.
+    def __init__(self, config_path: Optional[str] = None, sot_path: Optional[str] = None, data_dir: Optional[str] = None):
+        """Initialize server with config file, single SoT path, or data directory.
 
         Args:
             config_path: Path to JSON config file with multiple projects
             sot_path: Path to single SoT file (creates default project)
+            data_dir: Path to data directory (auto-discovers {project}/sot.json)
         """
         self._projects: dict[str, str] = {}  # name -> sot_path
         self._indexes: dict[str, SoTIndex] = {}  # name -> index (lazy loaded)
 
         if config_path:
             self._load_config(config_path)
+        elif data_dir:
+            self._discover_projects(data_dir)
         elif sot_path:
             self._projects["default"] = sot_path
         else:
-            raise ValueError("Either config_path or sot_path must be provided")
+            raise ValueError("Either config_path, sot_path, or data_dir must be provided")
 
     def _load_config(self, config_path: str):
         """Load projects from config file."""
@@ -76,6 +79,24 @@ class MCPServer:
             if not name or not sot:
                 raise ValueError("Each project must have 'name' and 'sot' fields")
             self._projects[name] = sot
+
+    def _discover_projects(self, data_dir: str):
+        """Auto-discover projects from data directory.
+
+        Scans for {data_dir}/{project_name}/sot.json files.
+        """
+        import os
+        data_path = os.path.abspath(data_dir)
+        if not os.path.isdir(data_path):
+            raise ValueError(f"Data directory not found: {data_path}")
+
+        for entry in sorted(os.listdir(data_path)):
+            sot_file = os.path.join(data_path, entry, "sot.json")
+            if os.path.isfile(sot_file):
+                self._projects[entry] = sot_file
+
+        if not self._projects:
+            raise ValueError(f"No projects found in {data_path} (expected {{project}}/sot.json)")
 
     def _get_index(self, project: Optional[str] = None) -> SoTIndex:
         """Get index for a project (lazy-loaded).
@@ -232,6 +253,20 @@ class MCPServer:
             raise ValueError(f"Unknown tool: {name}")
         return handler(arguments)
 
+    @staticmethod
+    def _int_arg(args: dict, key: str, default: int) -> int:
+        """Get an integer argument, coercing from string if needed (MCP sends strings)."""
+        val = args.get(key, default)
+        return int(val)
+
+    @staticmethod
+    def _bool_arg(args: dict, key: str, default: bool) -> bool:
+        """Get a boolean argument, coercing from string if needed (MCP sends strings)."""
+        val = args.get(key, default)
+        if isinstance(val, str):
+            return val.lower() in ("true", "1", "yes")
+        return bool(val)
+
     def _resolve_symbol(self, symbol: str, project: Optional[str] = None):
         """Resolve symbol and return node or raise error."""
         index = self._get_index(project)
@@ -264,7 +299,7 @@ class MCPServer:
         node = self._resolve_symbol(args["symbol"], project)
         index = self._get_index(project)
         query = UsagesQuery(index)
-        result = query.execute(node.id, depth=args.get("depth", 1), limit=args.get("limit", 50))
+        result = query.execute(node.id, depth=self._int_arg(args, "depth", 1), limit=self._int_arg(args, "limit", 50))
 
         def entry_to_dict(e):
             return {"depth": e.depth, "fqn": e.fqn, "file": e.file, "line": e.line + 1 if e.line else None, "children": [entry_to_dict(c) for c in e.children]}
@@ -276,7 +311,7 @@ class MCPServer:
         node = self._resolve_symbol(args["symbol"], project)
         index = self._get_index(project)
         query = DepsQuery(index)
-        result = query.execute(node.id, depth=args.get("depth", 1), limit=args.get("limit", 50))
+        result = query.execute(node.id, depth=self._int_arg(args, "depth", 1), limit=self._int_arg(args, "limit", 50))
 
         def entry_to_dict(e):
             return {"depth": e.depth, "fqn": e.fqn, "file": e.file, "line": e.line + 1 if e.line else None, "children": [entry_to_dict(c) for c in e.children]}
@@ -288,7 +323,7 @@ class MCPServer:
         node = self._resolve_symbol(args["symbol"], project)
         index = self._get_index(project)
         query = ContextQuery(index)
-        result = query.execute(node.id, depth=args.get("depth", 1), limit=args.get("limit", 50), include_impl=args.get("include_impl", False))
+        result = query.execute(node.id, depth=self._int_arg(args, "depth", 1), limit=self._int_arg(args, "limit", 50), include_impl=self._bool_arg(args, "include_impl", False))
 
         def entry_to_dict(e):
             d = {"depth": e.depth, "fqn": e.fqn, "kind": e.kind, "file": e.file, "line": e.line + 1 if e.line else None, "children": [entry_to_dict(c) for c in e.children]}
@@ -397,7 +432,7 @@ class MCPServer:
             raise ValueError(f"Symbol must be a class/interface, got: {node.kind}")
         index = self._get_index(project)
         query = InheritQuery(index)
-        result = query.execute(node.id, direction=args.get("direction", "up"), depth=args.get("depth", 1), limit=args.get("limit", 100))
+        result = query.execute(node.id, direction=args.get("direction", "up"), depth=self._int_arg(args, "depth", 1), limit=self._int_arg(args, "limit", 100))
 
         def entry_to_dict(e):
             return {"depth": e.depth, "kind": e.kind, "fqn": e.fqn, "file": e.file, "line": e.line + 1 if e.line else None, "children": [entry_to_dict(c) for c in e.children]}
@@ -411,7 +446,7 @@ class MCPServer:
             raise ValueError(f"Symbol must be a method, got: {node.kind}")
         index = self._get_index(project)
         query = OverridesQuery(index)
-        result = query.execute(node.id, direction=args.get("direction", "up"), depth=args.get("depth", 1), limit=args.get("limit", 100))
+        result = query.execute(node.id, direction=args.get("direction", "up"), depth=self._int_arg(args, "depth", 1), limit=self._int_arg(args, "limit", 100))
 
         def entry_to_dict(e):
             return {"depth": e.depth, "fqn": e.fqn, "file": e.file, "line": e.line + 1 if e.line else None, "children": [entry_to_dict(c) for c in e.children]}
@@ -419,14 +454,15 @@ class MCPServer:
         return {"root": {"fqn": node.fqn}, "direction": result.direction, "tree": [entry_to_dict(e) for e in result.tree]}
 
 
-def run_mcp_server(config_path: Optional[str] = None, sot_path: Optional[str] = None):
+def run_mcp_server(config_path: Optional[str] = None, sot_path: Optional[str] = None, data_dir: Optional[str] = None):
     """Run the MCP server using stdio with JSON-RPC 2.0 protocol.
 
     Args:
         config_path: Path to JSON config file with multiple projects
         sot_path: Path to single SoT file (creates default project)
+        data_dir: Path to data directory (auto-discovers projects)
     """
-    server = MCPServer(config_path=config_path, sot_path=sot_path)
+    server = MCPServer(config_path=config_path, sot_path=sot_path, data_dir=data_dir)
 
     def send_response(id: Any, result: Any = None, error: Any = None):
         response = {"jsonrpc": "2.0", "id": id}
@@ -482,8 +518,9 @@ def main():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--sot", "-s", help="Path to single SoT JSON file")
     group.add_argument("--config", "-c", help="Path to config JSON file with multiple projects")
+    group.add_argument("--data-dir", help="Path to data directory (auto-discovers {project}/sot.json)")
     args = parser.parse_args()
-    run_mcp_server(config_path=args.config, sot_path=args.sot)
+    run_mcp_server(config_path=args.config, sot_path=args.sot, data_dir=args.data_dir)
 
 
 if __name__ == "__main__":
